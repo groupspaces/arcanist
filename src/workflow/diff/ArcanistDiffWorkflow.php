@@ -406,9 +406,7 @@ EOTEXT
           $remote_corpus);
         $remote_message->pullDataFromConduit($conduit);
 
-        // TODO: We should throw here if you deleted the 'testPlan'.
-
-        $sync = array('title', 'summary', 'testPlan');
+        $sync = array('title', 'summary');
         foreach ($sync as $field) {
           $local = $message->getFieldValue($field);
           $remote_message->setFieldValue($field, $local);
@@ -921,12 +919,6 @@ EOTEXT
           $problems[$key][] = new ArcanistUsageException(
             "Commit message has no title. You must provide a title for this ".
             "revision.");
-        }
-
-        if (!$message->getFieldValue('testPlan')) {
-          $problems[$key][] = new ArcanistUsageException(
-            "Commit message has no 'Test Plan:'. You must provide a test ".
-            "plan.");
         }
       }
     }
