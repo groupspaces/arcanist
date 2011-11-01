@@ -412,6 +412,18 @@ EOTEXT
           $change->getNewProperties()
         );
         break;
+      case 'git-empty-files.gitdiff':
+        $this->assertEqual(2, count($changes));
+        while ($change = array_shift($changes)) {
+          $this->assertEqual(0, count($change->getHunks()));
+        }
+        break;
+      case 'git-mnemonicprefix.gitdiff':
+        // Check parsing of diffs created with `diff.mnemonicprefix`
+        // configuration option set to `true`.
+        $this->assertEqual(1, count($changes));
+        $this->assertEqual(1, count(reset($changes)->getHunks()));
+        break;
       case 'git-commit.gitdiff':
         $this->assertEqual(1, count($changes));
         $change = reset($changes);
@@ -454,6 +466,34 @@ git-svn-id: svn+ssh://tubbs/svnroot/tfb/trunk/www@223593 2c7ba8d8
 EOTEXT
           , $change->getMetadata('message')
         );
+        break;
+      case 'git-binary.gitdiff':
+        $this->assertEqual(1, count($changes));
+        $change = reset($changes);
+        $this->assertEqual(
+          ArcanistDiffChangeType::TYPE_CHANGE,
+          $change->getType());
+        $this->assertEqual(
+          ArcanistDiffChangeType::FILE_BINARY,
+          $change->getFileType());
+        break;
+      case 'hg-binary-change.hgdiff':
+      case 'hg-solo-binary-change.hgdiff':
+        $this->assertEqual(1, count($changes));
+        $change = reset($changes);
+        $this->assertEqual(
+          ArcanistDiffChangeType::TYPE_ADD,
+          $change->getType());
+        $this->assertEqual(
+          ArcanistDiffChangeType::FILE_BINARY,
+          $change->getFileType());
+        break;
+      case 'git-replace-symlink.gitdiff':
+        $this->assertEqual(1, count($changes));
+        $change = array_shift($changes);
+        $this->assertEqual(
+          ArcanistDiffChangeType::TYPE_CHANGE,
+          $change->getType());
         break;
       default:
         throw new Exception("No test block for diff file {$diff_file}.");

@@ -29,6 +29,7 @@ class ArcanistDiffParser {
   protected $isGit;
   protected $isMercurial;
   protected $detectBinaryFiles = false;
+  protected $tryEncoding;
 
   protected $changes = array();
   private $forcePath;
@@ -45,6 +46,10 @@ class ArcanistDiffParser {
   public function setDetectBinaryFiles($detect) {
     $this->detectBinaryFiles = $detect;
     return $this;
+  }
+
+  public function setTryEncoding($encoding) {
+    $this->tryEncoding = $encoding;
   }
 
   public function forcePath($path) {
@@ -204,7 +209,7 @@ class ArcanistDiffParser {
         // This is a git commit message, probably from "git show".
         '(?P<type>commit) (?P<hash>[a-f0-9]+)',
         // This is a git diff, probably from "git show" or "git diff".
-        '(?P<type>diff --git) a/(?P<old>.+) b/(?P<cur>.+)',
+        '(?P<type>diff --git) [abicwo12]/(?P<old>.+) [abicwo12]/(?P<cur>.+)',
         // This is a unified diff, probably from "diff -u" or synthetic diffing.
         '(?P<type>---) (?P<old>.+)\s+\d{4}-\d{2}-\d{2}.*',
         '(?P<binary>Binary) files '.
@@ -503,7 +508,14 @@ class ArcanistDiffParser {
         }
 
         if (!empty($match['new'])) {
-          $change->setType(ArcanistDiffChangeType::TYPE_ADD);
+          // If you replace a symlink with a normal file, git renders the change
+          // as a "delete" of the symlink plus an "add" of the new file. We
+          // prefer to represent this as a change.
+          if ($change->getType() == ArcanistDiffChangeType::TYPE_DELETE) {
+            $change->setType(ArcanistDiffChangeType::TYPE_CHANGE);
+          } else {
+            $change->setType(ArcanistDiffChangeType::TYPE_ADD);
+          }
         }
 
         if (!empty($match['old'])) {
@@ -569,7 +581,11 @@ class ArcanistDiffParser {
 
         // $this->didFailParse("Expected 'index af23f...a98bc' header line.");
       } else {
-        $line = $this->nextLine();
+        // NOTE: In the git case, where this patch is the last change in the
+        // file, we may have a final terminal newline. Skip over it so that
+        // we'll hit the '$line === null' block below. This is covered by the
+        // 'git-empty-file.gitdiff' test case.
+        $line = $this->nextNonemptyLine();
       }
     }
 
@@ -604,6 +620,26 @@ class ArcanistDiffParser {
       return;
     }
 
+    // With "git diff --binary" (not a normal mode, but one users may explicitly
+    // invoke and then, e.g., copy-paste into the web console) or "hg diff
+    // --git" (normal under hg workflows), we may encounter a literal binary
+    // patch.
+    $is_git_binary_patch = preg_match(
+      '/^GIT binary patch$/',
+      $line);
+    if ($is_git_binary_patch) {
+      $this->nextLine();
+      $this->parseGitBinaryPatch();
+      $line = $this->getLine();
+      if (preg_match('/^literal/', $line)) {
+        // We may have old/new binaries (change) or just a new binary (hg add).
+        // If there are two blocks, parse both.
+        $this->parseGitBinaryPatch();
+      }
+      $this->markBinary($change);
+      return;
+    }
+
     if ($is_git) {
       // "git diff -b" ignores whitespace, but has an empty hunk target
       if (preg_match('@^diff --git a/.*$@', $line)) {
@@ -618,6 +654,30 @@ class ArcanistDiffParser {
     $change->setOldPath($old_file);
 
     $this->parseChangeset($change);
+  }
+
+  private function parseGitBinaryPatch() {
+
+    // TODO: We could decode the patches, but it's a giant mess so don't bother
+    // for now. We'll pick up the data from the working copy in the common
+    // case ("arc diff").
+
+    $line = $this->getLine();
+    if (!preg_match('/^literal /', $line)) {
+      $this->didFailParse("Expected 'literal NNNN' to start git binary patch.");
+    }
+    do {
+      $line = $this->nextLine();
+      if ($line === '' || $line === null) {
+        // Some versions of Mercurial apparently omit the terminal newline,
+        // although it's unclear if Git will ever do this. In either case,
+        // rely on the base85 check for sanity.
+        $this->nextNonemptyLine();
+        return;
+      } else if (!preg_match('/^[a-zA-Z]/', $line)) {
+        $this->didFailParse("Expected base85 line length character (a-zA-Z).");
+      }
+    } while (true);
   }
 
   protected function parseHunkTarget() {
@@ -752,6 +812,21 @@ class ArcanistDiffParser {
       $is_binary = false;
       if ($this->detectBinaryFiles) {
         $is_binary = !phutil_is_utf8($corpus);
+
+        if ($is_binary && $this->tryEncoding) {
+          $is_binary = ArcanistDiffUtils::isHeuristicBinaryFile($corpus);
+          if (!$is_binary) {
+              // NOTE: This feature is HIGHLY EXPERIMENTAL and will cause a lot
+              // of issues. Use it at your own risk.
+              $corpus = mb_convert_encoding(
+                  $corpus, 'UTF-8', $this->tryEncoding);
+              if (!phutil_is_utf8($corpus)) {
+                  throw new Exception(
+                      'Failed converting hunk to '.$this->tryEncoding);
+              }
+          }
+        }
+
       }
 
       if ($is_binary) {
