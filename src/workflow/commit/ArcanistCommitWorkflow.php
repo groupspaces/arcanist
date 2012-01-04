@@ -23,6 +23,8 @@
  */
 class ArcanistCommitWorkflow extends ArcanistBaseWorkflow {
 
+  private $revisionID;
+
   public function getCommandHelp() {
     return phutil_console_format(<<<EOTEXT
       **commit** [--revision __revision_id__] [--show]
@@ -48,6 +50,10 @@ EOTEXT
     return true;
   }
 
+  public function getRevisionID() {
+    return $this->revisionID;
+  }
+
   public function getArguments() {
     return array(
       'show' => array(
@@ -68,7 +74,7 @@ EOTEXT
     $repository_api = $this->getRepositoryAPI();
     $conduit = $this->getConduit();
 
-    $revision_id = $this->getArgument('revision');
+    $revision_id = $this->normalizeRevisionID($this->getArgument('revision'));
 
     if (!$revision_id) {
       $revision_data = $conduit->callMethodSynchronous(
@@ -94,6 +100,8 @@ EOTEXT
           "commit revisions which have been 'accepted'.");
       }
     }
+
+    $this->revisionID = $revision_id;
 
     $revision = null;
     try {
@@ -132,6 +140,17 @@ EOTEXT
         'revision_id' => $revision_id,
         'edit'        => false,
       ));
+
+    $event = new PhutilEvent(
+      ArcanistEventType::TYPE_COMMIT_WILLCOMMITSVN,
+      array(
+        'message' => $message,
+        'workflow' => $this
+      )
+    );
+    PhutilEventEngine::dispatchEvent($event);
+
+    $message = $event->getValue('message');
 
     if ($this->getArgument('show')) {
       echo $message;
@@ -211,12 +230,23 @@ EOTEXT
       array(
         'revision_id' => $revision_id,
       ));
+    $dir_paths = array();
+    foreach ($commit_paths as $path) {
+      $path = dirname($path);
+      while ($path != '.') {
+        $dir_paths[$path] = true;
+        $path = dirname($path);
+      }
+    }
     $commit_paths = array_fill_keys($commit_paths, true);
 
     $status = $repository_api->getSVNStatus();
 
     $modified_but_not_included = array();
     foreach ($status as $path => $mask) {
+      if (!empty($dir_paths[$path])) {
+        $commit_paths[$path] = true;
+      }
       if (!empty($commit_paths[$path])) {
         continue;
       }

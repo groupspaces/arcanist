@@ -32,8 +32,8 @@ class ArcanistDiffWorkflow extends ArcanistBaseWorkflow {
   public function getCommandHelp() {
     return phutil_console_format(<<<EOTEXT
       **diff** [__paths__] (svn)
-      **diff** [__commit__] (git)
-          Supports: git, svn
+      **diff** [__commit__] (git, hg)
+          Supports: git, svn, hg
           Generate a Differential diff or revision from local changes.
 
           Under git, you can specify a commit (like __HEAD^^^__ or __master__)
@@ -82,6 +82,13 @@ EOTEXT
           "When updating a revision under git, use the specified message ".
           "instead of prompting.",
       ),
+      'message-file' => array(
+        'short' => 'F',
+        'param' => 'file',
+        'paramtype' => 'file',
+        'help' => 'When creating a revision, read revision information '.
+                  'from this file.',
+      ),
       'edit' => array(
         'supports'    => array(
           'git',
@@ -92,6 +99,12 @@ EOTEXT
         'help' =>
           "When updating a revision under git, edit revision information ".
           "before updating.",
+      ),
+      'create' => array(
+        'help' => "(EXPERIMENTAL) Create a new revision.",
+        'conflicts' => array(
+          'edit'    => '--create can not be used with --edit.',
+        ),
       ),
       'nounit' => array(
         'help' =>
@@ -137,6 +150,11 @@ EOTEXT
           'edit'      => '--preview does affect revisions.',
           'message'   => '--preview does not update any revision.',
         ),
+      ),
+      'encoding' => array(
+        'param' => 'encoding',
+        'help' =>
+          "Attempt to convert non UTF-8 hunks into specified encoding.",
       ),
       'allow-untracked' => array(
         'help' =>
@@ -206,6 +224,8 @@ EOTEXT
       ob_start();
     }
 
+    $is_create = $this->getArgument('create');
+
     $conduit = $this->getConduit();
     $this->requireCleanWorkingCopy();
 
@@ -215,7 +235,14 @@ EOTEXT
 
     // Do this before we start linting or running unit tests so we can detect
     // things like a missing test plan or invalid reviewers immediately.
-    if ($this->shouldOnlyCreateDiff()) {
+    if ($is_create) {
+      $message_file = $this->getArgument('message-file');
+      if ($message_file) {
+        $commit_message = $this->getCommitMessageFromFile($message_file);
+      } else {
+        $commit_message = $this->getCommitMessageFromUser();
+      }
+    } else if ($this->shouldOnlyCreateDiff()) {
       $commit_message = null;
     } else {
       $commit_message = $this->getGitCommitMessage();
@@ -453,45 +480,6 @@ EOTEXT
           $new_message = ArcanistDifferentialCommitMessage::newFromRawCorpus(
             $new_text);
           $new_message->pullDataFromConduit($conduit);
-/*
-          TODO: restore these checks
-
-
-          try { // <<< this try goes right after the edit
-
-            if (!$new_message->getTitle()) {
-              throw new UsageException(
-                "You can not remove the Revision title.");
-            }
-            if (!$new_message->getTestPlan()) {
-              throw new UsageException(
-                "You can not remove the 'Test Plan'.");
-            }
-            if ($new_message->getRevisionID() != $revision->getID()) {
-              throw new UsageException(
-                "You changed or deleted the Differential revision ID! Why ".
-                "would you do that?!");
-            }
-
-          } catch (Exception $ex) {
-            $ii = 0;
-            do {
-              $name = $ii
-                ? 'differential-message-'.$ii.'.txt'
-                : 'differential-message.txt';
-              if (!file_exists($name)) {
-                break;
-              }
-              ++$ii;
-            } while(true);
-            require_module_lazy('resource/filesystem');
-            Filesystem::writeFile($name, $new_text);
-            echo "Exception! Message was saved to '{$name}'.\n";
-            throw $ex;
-          }
-*/
-
-
 
           $revision['fields'] = $new_message->getFields();
         }
@@ -511,11 +499,16 @@ EOTEXT
           'differential.createrevision',
           $revision);
         $result = $future->resolve();
-        echo "Updating commit message to include Differential revision ID...\n";
-        $repository_api->amendGitHeadCommit(
-          $message->getRawCorpus().
-          "\n\n".
-          "Differential Revision: ".$result['revisionid']."\n");
+
+        $revised_message = $conduit->callMethodSynchronous(
+          'differential.getcommitmessage',
+          array(
+            'revision_id' => $result['revisionid'],
+          ));
+
+        echo "Updating commit message...\n";
+        $repository_api->amendGitHeadCommit($revised_message);
+
         echo "Created a new Differential revision:\n";
       }
 
@@ -676,23 +669,12 @@ EOTEXT
         $repository_api,
         $paths);
     } else if ($repository_api instanceof ArcanistGitAPI) {
-
       $diff = $repository_api->getFullGitDiff();
       if (!strlen($diff)) {
-        list($base, $tip) = $repository_api->getCommitRange();
-        if ($tip == 'HEAD') {
-          if (preg_match('/\^+HEAD/', $base)) {
-            $more = 'Did you mean HEAD^ instead of ^HEAD?';
-          } else {
-            $more = 'Did you specify the wrong relative commit?';
-          }
-        } else {
-          $more = 'Did you specify the wrong commit range?';
-        }
-        throw new ArcanistUsageException("No changes found. ({$more})");
+        throw new ArcanistUsageException(
+          "No changes found. (Did you specify the wrong commit range?)");
       }
       $changes = $parser->parseDiff($diff);
-
     } else if ($repository_api instanceof ArcanistMercurialAPI) {
       $diff = $repository_api->getFullMercurialDiff();
       $changes = $parser->parseDiff($diff);
@@ -747,10 +729,56 @@ EOTEXT
       }
     }
 
+    $try_encoding = null;
+
     $utf8_problems = array();
     foreach ($changes as $change) {
       foreach ($change->getHunks() as $hunk) {
-        if (!phutil_is_utf8($hunk->getCorpus())) {
+        $corpus = $hunk->getCorpus();
+        if (!phutil_is_utf8($corpus)) {
+
+          // If this corpus is heuristically binary, don't try to convert it.
+          // mb_check_encoding() and mb_convert_encoding() are both very very
+          // liberal about what they're willing to process.
+          $is_binary = ArcanistDiffUtils::isHeuristicBinaryFile($corpus);
+          if (!$is_binary) {
+            $try_encoding = nonempty($this->getArgument('encoding'), null);
+            if ($try_encoding === null) {
+              // Make a call to check if there's an encoding specified for this
+              // project.
+              try {
+                  $project_info = $this->getConduit()->callMethodSynchronous(
+                      'arcanist.projectinfo',
+                      array(
+                          'name' => $this->getWorkingCopy()->getProjectID(),
+                      ));
+                  $try_encoding = nonempty($project_info['encoding'], false);
+              } catch (ConduitClientException $e) {
+                  if ($e->getErrorCode() == 'ERR-BAD-ARCANIST-PROJECT') {
+                      echo phutil_console_wrap(
+                          "Lookup of encoding in arcanist project failed\n".
+                          $e->getMessage()
+                      );
+                      $try_encoding = false;
+                  } else {
+                      throw $e;
+                  }
+              }
+            }
+            if ($try_encoding) {
+              // NOTE: This feature is HIGHLY EXPERIMENTAL and will cause a lot
+              // of issues. Use it at your own risk.
+              $corpus = mb_convert_encoding($corpus, 'UTF-8', $try_encoding);
+              $name = $change->getCurrentPath();
+              if (phutil_is_utf8($corpus)) {
+                $this->writeStatusMessage(
+                  "[Experimental] Converted a '{$name}' hunk from ".
+                  "'{$try_encoding}' to UTF-8.\n");
+                $hunk->setCorpus($corpus);
+                continue;
+              }
+            }
+          }
           $utf8_problems[] = $change;
           break;
         }
@@ -761,11 +789,17 @@ EOTEXT
     // and treat them as binary changes. See D327 for discussion of why Arcanist
     // has this behavior.
     if ($utf8_problems) {
+      $learn_more =
+        "You can learn more about how Phabricator handles character encodings ".
+        "(and how to configure encoding settings and detect and correct ".
+        "encoding problems) by reading 'User Guide: UTF-8 and Character ".
+        "Encoding' in the Phabricator documentation.\n\n";
       if (count($utf8_problems) == 1) {
         $utf8_warning =
           "This diff includes a file which is not valid UTF-8 (it has invalid ".
           "byte sequences). You can either stop this workflow and fix it, or ".
           "continue. If you continue, this file will be marked as binary.\n\n".
+          $learn_more.
           "    AFFECTED FILE\n";
 
         $confirm = "Do you want to mark this file as binary and continue?";
@@ -775,6 +809,7 @@ EOTEXT
           "invalid byte sequences). You can either stop this workflow and fix ".
           "these files, or continue. If you continue, these files will be ".
           "marked as binary.\n\n".
+          $learn_more.
           "    AFFECTED FILES\n";
 
         $confirm = "Do you want to mark these files as binary and continue?";
@@ -802,29 +837,28 @@ EOTEXT
       }
 
       $path = $change->getCurrentPath();
+      $name = basename($path);
+
       $old_file = $repository_api->getOriginalFileData($path);
-      $new_file = $repository_api->getCurrentFileData($path);
-
-      $old_dict = $this->uploadFile($old_file, basename($path), 'old binary');
-      $new_dict = $this->uploadFile($new_file, basename($path), 'new binary');
-
+      $old_dict = $this->uploadFile($old_file, $name, 'old binary');
       if ($old_dict['guid']) {
         $change->setMetadata('old:binary-phid', $old_dict['guid']);
       }
+      $change->setMetadata('old:file:size',      $old_dict['size']);
+      $change->setMetadata('old:file:mime-type', $old_dict['mime']);
+
+      $new_file = $repository_api->getCurrentFileData($path);
+      $new_dict = $this->uploadFile($new_file, $name, 'new binary');
       if ($new_dict['guid']) {
         $change->setMetadata('new:binary-phid', $new_dict['guid']);
       }
-
-      $change->setMetadata('old:file:size',      strlen($old_file));
-      $change->setMetadata('new:file:size',      strlen($new_file));
-      $change->setMetadata('old:file:mime-type', $old_dict['mime']);
+      $change->setMetadata('new:file:size',      $new_dict['size']);
       $change->setMetadata('new:file:mime-type', $new_dict['mime']);
 
       if (preg_match('@^image/@', $new_dict['mime'])) {
         $change->setFileType(ArcanistDiffChangeType::FILE_IMAGE);
       }
     }
-
 
     return $changes;
   }
@@ -833,9 +867,11 @@ EOTEXT
     $result = array(
       'guid' => null,
       'mime' => null,
+      'size' => null
     );
 
-    if (!strlen($data)) {
+    $result['size'] = $size = strlen($data);
+    if (!$size) {
       return $result;
     }
 
@@ -846,17 +882,25 @@ EOTEXT
     $mime_type = trim($mime_type);
     $result['mime'] = $mime_type;
 
-    $bytes = strlen($data);
-    echo "Uploading {$desc} '{$name}' ({$mime_type}, {$bytes} bytes)...\n";
+    echo "Uploading {$desc} '{$name}' ({$mime_type}, {$size} bytes)...\n";
 
-    $guid = $this->getConduit()->callMethodSynchronous(
-      'file.upload',
-      array(
-        'data_base64' => base64_encode($data),
-        'name'        => $name,
+    try {
+      $guid = $this->getConduit()->callMethodSynchronous(
+        'file.upload',
+        array(
+          'data_base64' => base64_encode($data),
+          'name'        => $name,
       ));
 
-    $result['guid'] = $guid;
+      $result['guid'] = $guid;
+    } catch (ConduitClientException $e) {
+      $message = "Failed to upload {$desc} '{$name}'.  Continue?";
+      if (!phutil_console_confirm($message, $default_no = false)) {
+        throw new ArcanistUsageException(
+          'Aborted due to file upload failure.'
+        );
+      }
+    }
     return $result;
   }
 
@@ -886,6 +930,19 @@ EOTEXT
 
     $parser = new ArcanistDiffParser();
     $commit_messages = $repository_api->getGitCommitLog();
+
+    if (!strlen($commit_messages)) {
+      if (!$repository_api->getHasCommits()) {
+        throw new ArcanistUsageException(
+          "This git repository doesn't have any commits yet. You need to ".
+          "commit something before you can diff against it.");
+      } else {
+        throw new ArcanistUsageException(
+          "The commit range doesn't include any commits. (Did you diff ".
+          "against the wrong commit?)");
+      }
+    }
+
     $commit_messages = $parser->parseDiff($commit_messages);
 
     $problems = array();
@@ -901,25 +958,10 @@ EOTEXT
 
         $parsed[$key] = $message;
       } catch (ArcanistDifferentialCommitMessageParserException $ex) {
-        $problems[$key][] = $ex;
+        foreach ($ex->getParserErrors() as $problem) {
+          $problems[$key][] = $problem;
+        }
         continue;
-      }
-
-      // TODO: Move this all behind Conduit.
-      if (!$message->getRevisionID()) {
-        if ($message->getFieldValue('reviewedByPHIDs')) {
-          $problems[$key][] = new ArcanistUsageException(
-            "When creating or updating a revision, use the 'Reviewers:' ".
-            "field to specify reviewers, not 'Reviewed By:'. After the ".
-            "revision is accepted, run 'arc amend' to update the commit ".
-            "message.");
-        }
-
-        if (!$message->getFieldValue('title')) {
-          $problems[$key][] = new ArcanistUsageException(
-            "Commit message has no title. You must provide a title for this ".
-            "revision.");
-        }
       }
     }
 
@@ -943,8 +985,7 @@ EOTEXT
     }
 
     if ($revision_id === -1) {
-      $all_problems = call_user_func_array('array_merge', $problems);
-      $desc = implode("\n", mpull($all_problems, 'getMessage'));
+      $desc = implode("\n", array_mergev($problems));
       if (count($problems) > 1) {
         throw new ArcanistUsageException(
           "All changes between the specified commits have template parsing ".
@@ -1196,6 +1237,53 @@ EOTEXT
     }
 
     return null;
+  }
+
+  private function getCommitMessageFromUser() {
+    $conduit = $this->getConduit();
+
+    $template = $conduit->callMethodSynchronous(
+      'differential.getcommitmessage',
+      array(
+        'revision_id' => null,
+        'edit' => true,
+      ));
+
+    $template =
+      $template.
+      "\n\n".
+      "# Describe this revision.".
+      "\n";
+    $template = id(new PhutilInteractiveEditor($template))
+      ->setName('new-commit')
+      ->editInteractively();
+    $template = preg_replace('/^\s*#.*$/m', '', $template);
+
+    try {
+      $message = ArcanistDifferentialCommitMessage::newFromRawCorpus(
+        $template);
+      $message->pullDataFromConduit($conduit);
+    } catch (Exception $ex) {
+      $path = Filesystem::writeUniqueFile('arc-commit-message', $template);
+
+      echo phutil_console_wrap(
+        "\n".
+        "Exception while parsing commit message! Message saved to ".
+        "'{$path}'. Use -F <file> to specify a commit message file.\n");
+
+      throw $ex;
+    }
+
+    return $message;
+  }
+
+  private function getCommitMessageFromFile($file) {
+    $conduit = $this->getConduit();
+
+    $data = Filesystem::readFile($file);
+    $message = ArcanistDifferentialCommitMessage::newFromRawCorpus($data);
+    $message->pullDataFromConduit($conduit);
+    return $message;
   }
 
 }

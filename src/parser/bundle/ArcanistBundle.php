@@ -27,9 +27,18 @@ class ArcanistBundle {
   private $conduit;
   private $blobs = array();
   private $diskPath;
+  private $projectID;
 
   public function setConduit(ConduitClient $conduit) {
     $this->conduit = $conduit;
+  }
+
+  public function setProjectID($project_id) {
+    $this->projectID = $project_id;
+  }
+
+  public function getProjectID() {
+    return $this->projectID;
   }
 
   public static function newFromChanges(array $changes) {
@@ -40,6 +49,27 @@ class ArcanistBundle {
 
   public static function newFromArcBundle($path) {
     $path = Filesystem::resolvePath($path);
+
+    $future = new ExecFuture(
+      csprintf(
+        'tar tfO %s',
+        $path));
+    list($stdout, $file_list) = $future->resolvex();
+    $file_list = explode("\n", trim($file_list));
+
+    if (in_array('meta.json', $file_list)) {
+      $future = new ExecFuture(
+        csprintf(
+          'tar xfO %s meta.json',
+          $path));
+      $meta_info = $future->resolveJSON();
+      $version = idx($meta_info, 'version', 0);
+      $project_name = idx($meta_info, 'projectName');
+    // this arc bundle was probably made before we started storing meta info
+    } else {
+      $version = 0;
+      $project_name = null;
+    }
 
     $future = new ExecFuture(
       csprintf(
@@ -54,7 +84,6 @@ class ArcanistBundle {
       }
     }
 
-
     foreach ($changes as $change_key => $change) {
       $changes[$change_key] = ArcanistDiffChange::newFromDictionary($change);
     }
@@ -62,6 +91,7 @@ class ArcanistBundle {
     $obj = new ArcanistBundle();
     $obj->changes = $changes;
     $obj->diskPath = $path;
+    $obj->setProjectID($project_name);
 
     return $obj;
   }
@@ -108,10 +138,14 @@ class ArcanistBundle {
       $blobs[$phid] = $this->getBlob($phid);
     }
 
+    $meta_info = array('version' => 1,
+                       'projectName' => $this->getProjectID());
+
     $dir = Filesystem::createTemporaryDirectory();
     Filesystem::createDirectory($dir.'/hunks');
     Filesystem::createDirectory($dir.'/blobs');
     Filesystem::writeFile($dir.'/changes.json', json_encode($change_list));
+    Filesystem::writeFile($dir.'/meta.json', json_encode($meta_info));
     foreach ($hunks as $key => $hunk) {
       Filesystem::writeFile($dir.'/hunks/'.$key, $hunk);
     }
@@ -173,6 +207,50 @@ class ArcanistBundle {
   public function toGitPatch() {
     $result = array();
     $changes = $this->getChanges();
+
+    foreach (array_keys($changes) as $multicopy_key) {
+      $multicopy_change = $changes[$multicopy_key];
+
+      $type = $multicopy_change->getType();
+      if ($type != ArcanistDiffChangeType::TYPE_MULTICOPY) {
+        continue;
+      }
+
+      // Decompose MULTICOPY into one MOVE_HERE and several COPY_HERE because
+      // we need more information than we have in order to build a delete patch
+      // and represent it as a bunch of COPY_HERE plus a delete. For details,
+      // see T419.
+
+      // Basically, MULTICOPY means there are 2 or more corresponding COPY_HERE
+      // changes, so find one of them arbitrariy and turn it into a MOVE_HERE.
+
+      // TODO: We might be able to do this more cleanly after T230 is resolved.
+
+      $decompose_okay = false;
+      foreach ($changes as $change_key => $change) {
+        if ($change->getType() != ArcanistDiffChangeType::TYPE_COPY_HERE) {
+          continue;
+        }
+        if ($change->getOldPath() != $multicopy_change->getCurrentPath()) {
+          continue;
+        }
+        $decompose_okay = true;
+        $change = clone $change;
+        $change->setType(ArcanistDiffChangeType::TYPE_MOVE_HERE);
+        $changes[$change_key] = $change;
+
+        // The multicopy is now fully represented by MOVE_HERE plus one or more
+        // COPY_HERE, so throw it away.
+        unset($changes[$multicopy_key]);
+        break;
+      }
+
+      if (!$decompose_okay) {
+        throw new Exception(
+          "Failed to decompose multicopy changeset in order to generate diff.");
+      }
+    }
+
     foreach ($changes as $change) {
       $type = $change->getType();
       $file_type = $change->getFileType();
@@ -296,15 +374,39 @@ class ArcanistBundle {
 
       $hunk_start = max($jj - $context, 0);
 
+
+      // NOTE: There are two tricky considerations here.
+      // We can not generate a patch with overlapping hunks, or 'git apply'
+      // rejects it after 1.7.3.4.
+      // We can not generate a patch with too much trailing context, or
+      // 'patch' rejects it.
+      // So we need to ensure that we generate disjoint hunks, but don't
+      // generate any hunks with too much context.
+
       $old_lines = 0;
       $new_lines = 0;
       $last_change = $jj;
+      $break_here = null;
       for (; $jj < $n; ++$jj) {
         if ($lines[$jj][0] == ' ') {
+
           if ($jj - $last_change > $context) {
+            if ($break_here === null) {
+              // We haven't seen a change in $context lines, so this is a
+              // potential place to break the hunk. However, we need to keep
+              // looking in case there is another change fewer than $context
+              // lines away, in which case we have to merge the hunks.
+              $break_here = $jj;
+            }
+          }
+
+          if ($jj - $last_change > (($context + 1) * 2)) {
+            // We definitely aren't going to merge this with the next hunk, so
+            // break out of the loop. We'll end the hunk at $break_here.
             break;
           }
         } else {
+          $break_here = null;
           $last_change = $jj;
           if ($lines[$jj][0] == '-') {
             ++$old_lines;
@@ -312,6 +414,10 @@ class ArcanistBundle {
             ++$new_lines;
           }
         }
+      }
+
+      if ($break_here !== null) {
+        $jj = $break_here;
       }
 
       $hunk_length = min($jj, $n) - $hunk_start;

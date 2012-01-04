@@ -34,9 +34,10 @@ class ArcanistUnitWorkflow extends ArcanistBaseWorkflow {
 
   public function getCommandHelp() {
     return phutil_console_format(<<<EOTEXT
-      **unit**
+      **unit** [__paths__]
           Supports: git, svn
-          Run unit tests that cover local changes.
+          Run unit tests that cover specified paths. If no paths are specified,
+          unit tests covering all modified files will be run.
 EOTEXT
       );
   }
@@ -96,8 +97,13 @@ EOTEXT
       $paths = array_keys($paths);
     }
 
-
     PhutilSymbolLoader::loadClass($engine_class);
+    if (!is_subclass_of($engine_class, 'ArcanistBaseUnitTestEngine')) {
+      throw new ArcanistUsageException(
+        "Configured unit test engine '{$engine_class}' is not a subclass of ".
+        "'ArcanistBaseUnitTestEngine'.");
+    }
+
     $this->engine = newv($engine_class, array());
     $this->engine->setWorkingCopy($working_copy);
     $this->engine->setPaths($paths);

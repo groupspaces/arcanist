@@ -136,10 +136,9 @@ class ArcanistMercurialAPI extends ArcanistRepositoryAPI {
     return $logs;
   }
 
-
   public function getBlame($path) {
     list($stdout) = execx(
-      '(cd %s && hg blame -u -v -c --rev %s -- %s)',
+      '(cd %s && hg annotate -u -v -c --rev %s -- %s)',
       $this->getPath(),
       $this->getRelativeCommit(),
       $path);
@@ -151,7 +150,7 @@ class ArcanistMercurialAPI extends ArcanistRepositoryAPI {
       }
 
       $matches = null;
-      $ok = preg_match('^/\s*([^:]+?) [a-f0-9]{12}: (.*)$/', $line, $matches);
+      $ok = preg_match('/^\s*([^:]+?) [a-f0-9]{12}: (.*)$/', $line, $matches);
 
       if (!$ok) {
         throw new Exception("Unable to parse Mercurial blame line: {$line}");
@@ -205,6 +204,10 @@ class ArcanistMercurialAPI extends ArcanistRepositoryAPI {
 
       $working_status = ArcanistMercurialParser::parseMercurialStatus($stdout);
       foreach ($working_status as $path => $status) {
+        if ($status & ArcanistRepositoryAPI::FLAG_UNTRACKED) {
+          // If the file is untracked, don't mark it uncommitted.
+          continue;
+        }
         $status |= self::FLAG_UNCOMMITTED;
         if (!empty($status_map[$path])) {
           $status_map[$path] |= $status;
@@ -222,6 +225,11 @@ class ArcanistMercurialAPI extends ArcanistRepositoryAPI {
   private function getDiffOptions() {
     $options = array(
       '--git',
+      // NOTE: We can't use "--color never" because that flag is provided
+      // by the color extension, which may or may not be enabled. Instead,
+      // set the color mode configuration so that color is disabled regardless
+      // of whether the extension is present or not.
+      '--config color.mode=off',
       '-U'.$this->getDiffLinesOfContext(),
     );
     return implode(' ', $options);
@@ -265,11 +273,17 @@ class ArcanistMercurialAPI extends ArcanistRepositoryAPI {
   }
 
   private function getFileDataAtRevision($path, $revision) {
-    list($stdout) = execx(
+    list($err, $stdout) = exec_manual(
       '(cd %s && hg cat --rev %s -- %s)',
       $this->getPath(),
+      $revision,
       $path);
-    return $stdout;
+    if ($err) {
+      // Assume this is "no file at revision", i.e. a deleted or added file.
+      return null;
+    } else {
+      return $stdout;
+    }
   }
 
   private function getWorkingCopyRevision() {
@@ -283,7 +297,12 @@ class ArcanistMercurialAPI extends ArcanistRepositoryAPI {
     list($stdout) = execx(
       '(cd %s && hg --debug id --id)',
       $this->getPath());
-    return trim($stdout);
+
+    // Even with "--id", "hg id" will print a trailing "+" after the hash
+    // if the working copy is dirty (has uncommitted changes). We'll explicitly
+    // detect this later by calling getWorkingCopyStatus(); ignore it for now.
+    $stdout = trim($stdout);
+    return rtrim($stdout, '+');
   }
 
   public function supportsRelativeLocalCommits() {

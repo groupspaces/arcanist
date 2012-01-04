@@ -159,6 +159,11 @@ EOTEXT
     }
 
     PhutilSymbolLoader::loadClass($engine);
+    if (!is_subclass_of($engine, 'ArcanistLintEngine')) {
+      throw new ArcanistUsageException(
+        "Configured lint engine '{$engine}' is not a subclass of ".
+        "'ArcanistLintEngine'.");
+    }
 
     $engine = newv($engine, array());
     $engine->setWorkingCopy($working_copy);
@@ -170,19 +175,16 @@ EOTEXT
     }
 
     // Propagate information about which lines changed to the lint engine.
-    // This is used so that the lint engine can drop messages concerning
-    // lines that weren't in the change.
+    // This is used so that the lint engine can drop warning messages
+    // concerning lines that weren't in the change.
     $engine->setPaths($paths);
     if (!$should_lint_all) {
       foreach ($paths as $path) {
-        // Explicitly flag text changes, as line information doesn't apply
-        // to non-text files.
-        if ($this->isTextChange($path)) {
-          $engine->setTextChange($path);
-          $engine->setPathChangedLines(
-            $path,
-            $this->getChangedLines($path, 'new'));
-        }
+        // Note that getChangedLines() returns null to indicate that a file
+        // is binary or a directory (i.e., changed lines are not relevant).
+        $engine->setPathChangedLines(
+          $path,
+          $this->getChangedLines($path, 'new'));
       }
     }
 
@@ -205,6 +207,15 @@ EOTEXT
     switch ($this->getArgument('output')) {
       case 'json':
         $renderer = new ArcanistLintJSONRenderer();
+        $prompt_patches = false;
+        $apply_patches = false;
+        if ($this->getArgument('never-apply-patches') ||
+            $this->getArgument('apply-patches')) {
+          throw new ArcanistUsageException(
+            "Automatic patch suggestion is disabled when using JSON output. ".
+            "Remove --never-apply-patches or --apply-patches."
+          );
+        }
         break;
       case 'summary':
         $renderer = new ArcanistLintSummaryRenderer();
@@ -296,8 +307,7 @@ EOTEXT
 
     if (!$this->getParentWorkflow()) {
       if ($result_code == self::RESULT_OKAY) {
-        echo phutil_console_format(
-          "<bg:green>** OKAY **</bg> No lint warnings.\n");
+        echo $renderer->renderOkayResult();
       }
     }
 

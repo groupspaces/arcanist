@@ -67,12 +67,7 @@ abstract class ArcanistLinter {
 
   protected function getData($path) {
     if (!array_key_exists($path, $this->data)) {
-      $disk_path = $this->getEngine()->getFilePathOnDisk($path);
-      if ($disk_path) {
-        $this->data[$path] = Filesystem::readFile($disk_path);
-      } else {
-        throw new Exception("Data is not provided for path '{$path}'!");
-      }
+      $this->data[$path] = $this->getEngine()->loadData($path);
     }
     return $this->data[$path];
   }
@@ -102,6 +97,11 @@ abstract class ArcanistLinter {
     }
 
     return ArcanistLintSeverity::SEVERITY_ERROR;
+  }
+
+  public function isMessageEnabled($code) {
+    return ($this->getLintMessageSeverity($code) !==
+            ArcanistLintSeverity::SEVERITY_DISABLED);
   }
 
   public function getLintMessageName($code) {

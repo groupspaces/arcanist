@@ -44,9 +44,14 @@ class ArcanistLintJSONRenderer {
           $message->getLine() - self::LINES_OF_CONTEXT,
           self::LINES_OF_CONTEXT * 2 + 1
         )),
+        'description' => $message->getDescription(),
       );
     }
 
     return json_encode($output)."\n";
+  }
+
+  public function renderOkayResult() {
+    return "\n";
   }
 }
