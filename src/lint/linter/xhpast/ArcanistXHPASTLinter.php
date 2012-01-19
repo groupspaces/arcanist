@@ -1,7 +1,7 @@
 <?php
 
 /*
- * Copyright 2011 Facebook, Inc.
+ * Copyright 2012 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -168,7 +168,24 @@ class ArcanistXHPASTLinter extends ArcanistLinter {
         continue;
       }
       list($before, $after) = $list->getSurroundingNonsemanticTokens();
-      if (count($before) == 1) {
+      if (!$before) {
+        $first = head($tokens);
+
+        // Only insert the space if we're after a closing parenthesis. If
+        // we're in a construct like "else{}", other rules will insert space
+        // after the 'else' correctly.
+        $prev = $first->getPrevToken();
+        if (!$prev || $prev->getValue() != ')') {
+          continue;
+        }
+
+        $this->raiseLintAtToken(
+          $first,
+          self::LINT_FORMATTING_CONVENTIONS,
+          'Put opening braces on the same line as control statements and '.
+          'declarations, with a single space before them.',
+          ' '.$first->getValue());
+      } else if (count($before) == 1) {
         $before = reset($before);
         if ($before->getValue() != ' ') {
           $this->raiseLintAtToken(
@@ -954,6 +971,30 @@ class ArcanistXHPASTLinter extends ArcanistLinter {
               self::LINT_FORMATTING_CONVENTIONS,
               'Convention: put a space after control statements.',
               $token->getValue().' ');
+          } else if (count($after) == 1) {
+            $space = head($after);
+
+            // If we have an else clause with braces, $space may not be
+            // a single white space. e.g.,
+            //
+            //  if ($x)
+            //    echo 'foo'
+            //  else          // <- $space is not " " but "\n  ".
+            //    echo 'bar'
+            //
+            // We just require it starts with either a whitespace or a newline.
+            if ($token->getTypeName() == 'T_ELSE' ||
+                $token->getTypeName() == 'T_DO') {
+              break;
+            }
+
+            if ($space->isAnyWhitespace() && $space->getValue() != ' ') {
+              $this->raiseLintAtToken(
+                $space,
+                self::LINT_FORMATTING_CONVENTIONS,
+                'Convention: put a single space after control statements.',
+                ' ');
+            }
           }
           break;
       }

@@ -1,7 +1,7 @@
 <?php
 
 /*
- * Copyright 2011 Facebook, Inc.
+ * Copyright 2012 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,11 @@
 
 /**
  * Sends changes from your working copy to Differential for code review.
+ *
+ * @task lintunit   Lint and Unit Tests
+ * @task message    Commit and Update Messages
+ * @task diffspec   Diff Specification
+ * @task diffprop   Diff Properties
  *
  * @group workflow
  */
@@ -48,7 +53,7 @@ EOTEXT
       );
   }
   public function requiresWorkingCopy() {
-    return true;
+    return !$this->isRawDiffSource();
   }
 
   public function requiresConduit() {
@@ -60,7 +65,7 @@ EOTEXT
   }
 
   public function requiresRepositoryAPI() {
-    return true;
+    return !$this->isRawDiffSource();
   }
 
   public function getDiffID() {
@@ -89,6 +94,20 @@ EOTEXT
         'help' => 'When creating a revision, read revision information '.
                   'from this file.',
       ),
+      'use-commit-message' => array(
+        'supports' => array(
+          'git',
+          // TODO: Support mercurial.
+        ),
+        'short' => 'C',
+        'param' => 'commit',
+        'help' => 'Read revision information from a specific commit.',
+        'conflicts' => array(
+          'only'    => null,
+          'preview' => null,
+          'update'  => null,
+        ),
+      ),
       'edit' => array(
         'supports'    => array(
           'git',
@@ -100,11 +119,51 @@ EOTEXT
           "When updating a revision under git, edit revision information ".
           "before updating.",
       ),
+      'raw' => array(
+        'help' =>
+          "Read diff from stdin, not from the working copy. This disables ".
+          "many Arcanist/Phabricator features which depend on having access ".
+          "to the working copy.",
+        'conflicts' => array(
+          'less-context'        => null,
+          'apply-patches'       => '--raw disables lint.',
+          'never-apply-patches' => '--raw disables lint.',
+          'advice'              => '--raw disables lint.',
+          'lintall'             => '--raw disables lint.',
+
+          'create'              => '--raw and --create both need stdin. '.
+                                   'Use --raw-command.',
+          'edit'                => '--raw and --edit both need stdin. '.
+                                   'Use --raw-command.',
+          'raw-command'         => null,
+        ),
+      ),
+      'raw-command' => array(
+        'param' => 'command',
+        'help' =>
+          "Generate diff by executing a specified command, not from the ".
+          "working copy. This disables many Arcanist/Phabricator features ".
+          "which depend on having access to the working copy.",
+        'conflicts' => array(
+          'less-context'        => null,
+          'apply-patches'       => '--raw-command disables lint.',
+          'never-apply-patches' => '--raw-command disables lint.',
+          'advice'              => '--raw-command disables lint.',
+          'lintall'             => '--raw-command disables lint.',
+        ),
+      ),
       'create' => array(
-        'help' => "(EXPERIMENTAL) Create a new revision.",
+        'help' => "Always create a new revision.",
         'conflicts' => array(
           'edit'    => '--create can not be used with --edit.',
+          'only'    => '--create can not be used with --only.',
+          'preview' => '--create can not be used with --preview.',
+          'update'  => '--create can not be used with --update.',
         ),
+      ),
+      'update' => array(
+        'param' => 'revision_id',
+        'help'  => "Always update a specific revision.",
       ),
       'nounit' => array(
         'help' =>
@@ -123,7 +182,7 @@ EOTEXT
       'only' => array(
         'help' =>
           "Only generate a diff, without running lint, unit tests, or other ".
-          "auxiliary steps.",
+          "auxiliary steps. See also --preview.",
         'conflicts' => array(
           'preview'   => null,
           'message'   => '--only does not affect revisions.',
@@ -210,11 +269,17 @@ EOTEXT
     );
   }
 
-  public function run() {
-    $repository_api = $this->getRepositoryAPI();
+  public function isRawDiffSource() {
+    return $this->getArgument('raw') || $this->getArgument('raw-command');
+  }
 
-    if ($this->getArgument('less-context')) {
-      $repository_api->setDiffLinesOfContext(3);
+  public function run() {
+
+    if ($this->requiresRepositoryAPI()) {
+      $repository_api = $this->getRepositoryAPI();
+      if ($this->getArgument('less-context')) {
+        $repository_api->setDiffLinesOfContext(3);
+      }
     }
 
     $output_json = $this->getArgument('json');
@@ -224,29 +289,17 @@ EOTEXT
       ob_start();
     }
 
-    $is_create = $this->getArgument('create');
-
     $conduit = $this->getConduit();
-    $this->requireCleanWorkingCopy();
 
-    $parent = null;
+    if ($this->requiresWorkingCopy()) {
+      $this->requireCleanWorkingCopy();
+    }
 
     $paths = $this->generateAffectedPaths();
 
     // Do this before we start linting or running unit tests so we can detect
     // things like a missing test plan or invalid reviewers immediately.
-    if ($is_create) {
-      $message_file = $this->getArgument('message-file');
-      if ($message_file) {
-        $commit_message = $this->getCommitMessageFromFile($message_file);
-      } else {
-        $commit_message = $this->getCommitMessageFromUser();
-      }
-    } else if ($this->shouldOnlyCreateDiff()) {
-      $commit_message = null;
-    } else {
-      $commit_message = $this->getGitCommitMessage();
-    }
+    $commit_message = $this->buildCommitMessage();
 
     $lint_result = $this->runLint($paths);
     $unit_result = $this->runUnit($paths);
@@ -257,143 +310,25 @@ EOTEXT
         "There are no changes to generate a diff from!");
     }
 
-    $change_list = array();
-    foreach ($changes as $change) {
-      $change_list[] = $change->toDictionary();
-    }
-
-    if ($lint_result === ArcanistLintWorkflow::RESULT_OKAY) {
-      $lint = 'okay';
-    } else if ($lint_result === ArcanistLintWorkflow::RESULT_ERRORS) {
-      $lint = 'fail';
-    } else if ($lint_result === ArcanistLintWorkflow::RESULT_WARNINGS) {
-      $lint = 'warn';
-    } else if ($lint_result === ArcanistLintWorkflow::RESULT_SKIP) {
-      $lint = 'skip';
-    } else {
-      $lint = 'none';
-    }
-
-    if ($unit_result === ArcanistUnitWorkflow::RESULT_OKAY) {
-      $unit = 'okay';
-    } else if ($unit_result === ArcanistUnitWorkflow::RESULT_FAIL) {
-      $unit = 'fail';
-    } else if ($unit_result === ArcanistUnitWorkflow::RESULT_UNSOUND) {
-      $unit = 'warn';
-    } else if ($unit_result === ArcanistUnitWorkflow::RESULT_SKIP) {
-      $unit = 'skip';
-    } else if ($unit_result === ArcanistUnitWorkflow::RESULT_POSTPONED) {
-      $unit = 'postponed';
-    } else {
-      $unit = 'none';
-    }
-
-    // NOTE: This has to happen after generateChanges(), since it may overwrite
-    // the SVN effective base revision.
-    $base_revision = $repository_api->getSourceControlBaseRevision();
-    $base_path     = $repository_api->getSourceControlPath();
-    $repo_uuid     = null;
-    if ($repository_api instanceof ArcanistGitAPI) {
-      $info = $this->getGitParentLogInfo();
-      if ($info['parent']) {
-        $parent = $info['parent'];
-      }
-      if ($info['base_revision']) {
-        $base_revision = $info['base_revision'];
-      }
-      if ($info['base_path']) {
-        $base_path = $info['base_path'];
-      }
-      if ($info['uuid']) {
-        $repo_uuid = $info['uuid'];
-      }
-    } else if ($repository_api instanceof ArcanistSubversionAPI) {
-      $repo_uuid = $repository_api->getRepositorySVNUUID();
-    } else if ($repository_api instanceof ArcanistMercurialAPI) {
-      // TODO: Provide this information.
-    } else {
-      throw new Exception("Unsupported repository API!");
-    }
-
-    $working_copy = $this->getWorkingCopy();
-
-    $diff = array(
-      'changes'                   => $change_list,
-      'sourceMachine'             => php_uname('n'),
-      'sourcePath'                => $repository_api->getPath(),
-      'branch'                    => $repository_api->getBranchName(),
-      'sourceControlSystem'       =>
-        $repository_api->getSourceControlSystemName(),
-      'sourceControlPath'         => $base_path,
-      'sourceControlBaseRevision' => $base_revision,
-      'parentRevisionID'          => $parent,
-      'lintStatus'                => $lint,
-      'unitStatus'                => $unit,
-
-      'repositoryUUID'            => $repo_uuid,
-      'creationMethod'            => 'arc',
-      'arcanistProject'           => $working_copy->getProjectID(),
-      'authorPHID'                => $this->getUserPHID(),
-    );
+    $diff_spec = array(
+      'changes'                   => mpull($changes, 'toDictionary'),
+      'lintStatus'                => $this->getLintStatus($lint_result),
+      'unitStatus'                => $this->getUnitStatus($unit_result),
+    ) + $this->buildDiffSpecification();
 
     $diff_info = $conduit->callMethodSynchronous(
       'differential.creatediff',
-      $diff);
+      $diff_spec);
+
+    $this->diffID = $diff_info['diffid'];
 
     if ($this->unitWorkflow) {
       $this->unitWorkflow->setDifferentialDiffID($diff_info['diffid']);
     }
 
-    if ($this->unresolvedLint) {
-      $data = array();
-      foreach ($this->unresolvedLint as $message) {
-        $data[] = array(
-          'path'        => $message->getPath(),
-          'line'        => $message->getLine(),
-          'char'        => $message->getChar(),
-          'code'        => $message->getCode(),
-          'severity'    => $message->getSeverity(),
-          'name'        => $message->getName(),
-          'description' => $message->getDescription(),
-        );
-      }
-      $conduit->callMethodSynchronous(
-        'differential.setdiffproperty',
-        array(
-          'diff_id' => $diff_info['diffid'],
-          'name'    => 'arc:lint',
-          'data'    => json_encode($data),
-        ));
-    }
-
-    $local_info = $repository_api->getLocalCommitInformation();
-    if ($local_info) {
-      $conduit->callMethodSynchronous(
-        'differential.setdiffproperty',
-        array(
-          'diff_id' => $diff_info['diffid'],
-          'name'    => 'local:commits',
-          'data'    => json_encode($local_info),
-        ));
-    }
-
-    if ($this->unresolvedTests) {
-      $data = array();
-      foreach ($this->unresolvedTests as $test) {
-        $data[] = array(
-          'name'      => $test->getName(),
-          'result'    => $test->getResult(),
-          'userdata'  => $test->getUserData(),
-        );
-      }
-      $conduit->callMethodSynchronous(
-        'differential.setdiffproperty',
-        array(
-          'diff_id' => $diff_info['diffid'],
-          'name'    => 'arc:unit',
-          'data'    => json_encode($data),
-        ));
-    }
+    $this->updateLintDiffProperty();
+    $this->updateUnitDiffProperty();
+    $this->updateLocalDiffProperty();
 
     if ($this->shouldOnlyCreateDiff()) {
       if (!$output_json) {
@@ -405,16 +340,17 @@ EOTEXT
         $human = ob_get_clean();
         echo json_encode(array(
           'diffURI' => $diff_info['uri'],
-          'diffID'  => $diff_info['diffid'],
+          'diffID'  => $this->getDiffID(),
           'human'   => $human,
         ))."\n";
         ob_start();
       }
     } else {
+
       $message = $commit_message;
 
       $revision = array(
-        'diffid' => $diff_info['diffid'],
+        'diffid' => $this->getDiffID(),
         'fields' => $message->getFields(),
       );
 
@@ -506,8 +442,14 @@ EOTEXT
             'revision_id' => $result['revisionid'],
           ));
 
-        echo "Updating commit message...\n";
-        $repository_api->amendGitHeadCommit($revised_message);
+        if ($this->requiresRepositoryAPI()) {
+          $repository_api = $this->getRepositoryAPI();
+          if (($repository_api instanceof ArcanistGitAPI) &&
+              !$this->isHistoryImmutable()) {
+            echo "Updating commit message...\n";
+            $repository_api->amendGitHeadCommit($revised_message);
+          }
+        }
 
         echo "Created a new Differential revision:\n";
       }
@@ -523,8 +465,6 @@ EOTEXT
       echo '  '.$change->renderTextSummary()."\n";
     }
 
-    $this->diffID = $diff_info['diffid'];
-
     if ($output_json) {
       ob_get_clean();
     }
@@ -533,6 +473,22 @@ EOTEXT
   }
 
   protected function shouldOnlyCreateDiff() {
+
+    if ($this->getArgument('create')) {
+      return false;
+    }
+
+    if ($this->getArgument('update')) {
+      return false;
+    }
+
+    if ($this->getArgument('use-commit-message')) {
+      return false;
+    }
+
+    if ($this->isRawDiffSource()) {
+      return true;
+    }
 
     $repository_api = $this->getRepositoryAPI();
     if ($repository_api instanceof ArcanistSubversionAPI) {
@@ -551,11 +507,11 @@ EOTEXT
            $this->getArgument('only');
   }
 
-  protected function findRevisionInformation() {
-    return array(null, null);
-  }
-
   private function generateAffectedPaths() {
+    if ($this->isRawDiffSource()) {
+      return array();
+    }
+
     $repository_api = $this->getRepositoryAPI();
     if ($repository_api instanceof ArcanistSubversionAPI) {
       $file_list = new FileList($this->getArgument('paths', array()));
@@ -615,9 +571,32 @@ EOTEXT
 
 
   protected function generateChanges() {
+    $parser = new ArcanistDiffParser();
+
+    $is_raw = $this->isRawDiffSource();
+    if ($is_raw) {
+
+      if ($this->getArgument('raw')) {
+        file_put_contents('php://stderr', "Reading diff from stdin...\n");
+        $raw_diff = file_get_contents('php://stdin');
+      } else if ($this->getArgument('raw-command')) {
+        list($raw_diff) = execx($this->getArgument('raw-command'));
+      } else {
+        throw new Exception("Unknown raw diff source.");
+      }
+
+      $changes = $parser->parseDiff($raw_diff);
+      foreach ($changes as $key => $change) {
+        // Remove "message" changes, e.g. from "git show".
+        if ($change->getType() == ArcanistDiffChangeType::TYPE_MESSAGE) {
+          unset($changes[$key]);
+        }
+      }
+      return $changes;
+    }
+
     $repository_api = $this->getRepositoryAPI();
 
-    $parser = new ArcanistDiffParser();
     if ($repository_api instanceof ArcanistSubversionAPI) {
       $paths = $this->generateAffectedPaths();
       $this->primeSubversionWorkingCopyData($paths);
@@ -904,122 +883,6 @@ EOTEXT
     return $result;
   }
 
-  /**
-   * Retrieve the git message in HEAD if it isn't a primary template message.
-   */
-  private function getGitUpdateMessage() {
-    $repository_api = $this->getRepositoryAPI();
-
-    $parser = new ArcanistDiffParser();
-    $commit_messages = $repository_api->getGitCommitLog();
-    $commit_messages = $parser->parseDiff($commit_messages);
-
-    $head = reset($commit_messages);
-    $message = ArcanistDifferentialCommitMessage::newFromRawCorpus(
-      $head->getMetadata('message'));
-    if ($message->getRevisionID()) {
-      return null;
-    }
-
-    return trim($message->getRawCorpus());
-  }
-
-  private function getGitCommitMessage() {
-    $conduit = $this->getConduit();
-    $repository_api = $this->getRepositoryAPI();
-
-    $parser = new ArcanistDiffParser();
-    $commit_messages = $repository_api->getGitCommitLog();
-
-    if (!strlen($commit_messages)) {
-      if (!$repository_api->getHasCommits()) {
-        throw new ArcanistUsageException(
-          "This git repository doesn't have any commits yet. You need to ".
-          "commit something before you can diff against it.");
-      } else {
-        throw new ArcanistUsageException(
-          "The commit range doesn't include any commits. (Did you diff ".
-          "against the wrong commit?)");
-      }
-    }
-
-    $commit_messages = $parser->parseDiff($commit_messages);
-
-    $problems = array();
-    $parsed = array();
-    foreach ($commit_messages as $key => $change) {
-      $problems[$key] = array();
-
-      try {
-        $message = ArcanistDifferentialCommitMessage::newFromRawCorpus(
-          $change->getMetadata('message'));
-
-        $message->pullDataFromConduit($conduit);
-
-        $parsed[$key] = $message;
-      } catch (ArcanistDifferentialCommitMessageParserException $ex) {
-        foreach ($ex->getParserErrors() as $problem) {
-          $problems[$key][] = $problem;
-        }
-        continue;
-      }
-    }
-
-    $blessed = null;
-    $revision_id = -1;
-    foreach ($problems as $key => $problem_list) {
-      if ($problem_list) {
-        continue;
-      }
-      if ($revision_id === -1) {
-        $revision_id = $parsed[$key]->getRevisionID();
-        $blessed = $parsed[$key];
-      } else {
-        throw new ArcanistUsageException(
-          "Changes in the specified commit range include more than one ".
-          "commit with a valid template commit message. This is ambiguous, ".
-          "your commit range should contain only one template commit ".
-          "message. Alternatively, use --preview to ignore commit ".
-          "messages.");
-      }
-    }
-
-    if ($revision_id === -1) {
-      $desc = implode("\n", array_mergev($problems));
-      if (count($problems) > 1) {
-        throw new ArcanistUsageException(
-          "All changes between the specified commits have template parsing ".
-          "problems:\n\n".$desc."\n\nIf you only want to create a diff ".
-          "(not a revision), use --preview to ignore commit messages.");
-      } else if (count($problems) == 1) {
-        $user_guide = 'http://phabricator.com/docs/phabricator/'.
-                      'article/Arcanist_User_Guide.html';
-        throw new ArcanistUsageException(
-          "Commit message is not properly formatted:\n\n".$desc."\n\n".
-          "You should use the standard git commit template to provide a ".
-          "commit message. If you only want to create a diff (not a ".
-          "revision), use --preview to ignore commit messages.\n\n".
-          "See this document for instructions on configuring the commit ".
-          "template:\n\n    {$user_guide}\n");
-      }
-    }
-
-    if ($blessed) {
-      $reviewers = $blessed->getFieldValue('reviewerPHIDs');
-      if (!$reviewers) {
-        $message = "You have not specified any reviewers. Continue anyway?";
-        if (!phutil_console_confirm($message)) {
-          throw new ArcanistUsageException('Specify reviewers and retry.');
-        }
-      } else if (in_array($this->getUserPHID(), $reviewers)) {
-        throw new ArcanistUsageException(
-          "You can not be a reviewer for your own revision.");
-      }
-    }
-
-    return $blessed;
-  }
-
   private function getGitParentLogInfo() {
     $info = array(
       'parent'        => null,
@@ -1091,45 +954,17 @@ EOTEXT
     }
   }
 
-  private function getUpdateMessage() {
-    $comments = $this->getArgument('message');
-    if (!strlen($comments)) {
 
-      // When updating a revision using git without specifying '--message', try
-      // to prefill with the message in HEAD if it isn't a template message. The
-      // idea is that if you do:
-      //
-      //  $ git commit -a -m 'fix some junk'
-      //  $ arc diff
-      //
-      // ...you shouldn't have to retype the update message.
-      $repository_api = $this->getRepositoryAPI();
-      if ($repository_api instanceof ArcanistGitAPI) {
-        $comments = $this->getGitUpdateMessage();
-      }
+/* -(  Lint and Unit Tests  )------------------------------------------------ */
 
-      $template =
-        $comments.
-        "\n\n".
-        "# Enter a brief description of the changes included in this update.".
-        "\n";
-      $comments = id(new PhutilInteractiveEditor($template))
-        ->setName('differential-update-comments')
-        ->editInteractively();
-      $comments = preg_replace('/^\s*#.*$/m', '', $comments);
 
-      $comments = rtrim($comments);
-      if (!strlen($comments)) {
-        throw new ArcanistUserAbortException();
-      }
-    }
-
-    return $comments;
-  }
-
+  /**
+   * @task lintunit
+   */
   private function runLint($paths) {
     if ($this->getArgument('nolint') ||
-        $this->getArgument('only')) {
+        $this->getArgument('only') ||
+        $this->isRawDiffSource()) {
       return ArcanistLintWorkflow::RESULT_SKIP;
     }
 
@@ -1138,9 +973,8 @@ EOTEXT
     echo "Linting...\n";
     try {
       $argv = $this->getPassthruArgumentsAsArgv('lint');
-      if ($repository_api instanceof ArcanistSubversionAPI) {
-        $argv = array_merge($argv, array_keys($paths));
-      } else {
+      if ($repository_api->supportsRelativeLocalCommits()) {
+        $argv[] = '--rev';
         $argv[] = $repository_api->getRelativeCommit();
       }
       $lint_workflow = $this->buildChildWorkflow('lint', $argv);
@@ -1187,9 +1021,14 @@ EOTEXT
     return null;
   }
 
+
+  /**
+   * @task lintunit
+   */
   private function runUnit($paths) {
     if ($this->getArgument('nounit') ||
-        $this->getArgument('only')) {
+        $this->getArgument('only') ||
+        $this->isRawDiffSource()) {
       return ArcanistUnitWorkflow::RESULT_SKIP;
     }
 
@@ -1198,8 +1037,9 @@ EOTEXT
     echo "Running unit tests...\n";
     try {
       $argv = $this->getPassthruArgumentsAsArgv('unit');
-      if ($repository_api instanceof ArcanistSubversionAPI) {
-        $argv = array_merge($argv, array_keys($paths));
+      if ($repository_api->supportsRelativeLocalCommits()) {
+        $argv[] = '--rev';
+        $argv[] = $repository_api->getRelativeCommit();
       }
       $this->unitWorkflow = $this->buildChildWorkflow('unit', $argv);
       $unit_result = $this->unitWorkflow->run();
@@ -1239,6 +1079,65 @@ EOTEXT
     return null;
   }
 
+
+/* -(  Commit and Update Messages  )----------------------------------------- */
+
+
+  /**
+   * @task message
+   */
+  private function buildCommitMessage() {
+    $is_create = $this->getArgument('create');
+    $is_update = $this->getArgument('update');
+    $is_raw = $this->isRawDiffSource();
+    $is_message = $this->getArgument('use-commit-message');
+
+    if ($is_message) {
+      return $this->getCommitMessageFromCommit($is_message);
+    }
+
+    $message = null;
+    if ($is_create) {
+      $message_file = $this->getArgument('message-file');
+      if ($message_file) {
+        return $this->getCommitMessageFromFile($message_file);
+      } else {
+        return $this->getCommitMessageFromUser();
+      }
+    }
+
+    if ($is_update) {
+      return $this->getCommitMessageFromRevision($is_update);
+    }
+
+    if ($is_raw) {
+      return null;
+    }
+
+    if (!$this->shouldOnlyCreateDiff()) {
+      return $this->getGitCommitMessage();
+    }
+
+    return null;
+  }
+
+
+  /**
+   * @task message
+   */
+  private function getCommitMessageFromCommit($rev) {
+    $change = $this->getRepositoryAPI()->getCommitMessageForRevision($rev);
+    $message = ArcanistDifferentialCommitMessage::newFromRawCorpus(
+      $change->getMetadata('message'));
+    $message->pullDataFromConduit($this->getConduit());
+    $this->validateCommitMessage($message);
+    return $message;
+  }
+
+
+  /**
+   * @task message
+   */
   private function getCommitMessageFromUser() {
     $conduit = $this->getConduit();
 
@@ -1263,6 +1162,7 @@ EOTEXT
       $message = ArcanistDifferentialCommitMessage::newFromRawCorpus(
         $template);
       $message->pullDataFromConduit($conduit);
+      $this->validateCommitMessage($message);
     } catch (Exception $ex) {
       $path = Filesystem::writeUniqueFile('arc-commit-message', $template);
 
@@ -1277,13 +1177,453 @@ EOTEXT
     return $message;
   }
 
+
+  /**
+   * @task message
+   */
   private function getCommitMessageFromFile($file) {
     $conduit = $this->getConduit();
 
     $data = Filesystem::readFile($file);
     $message = ArcanistDifferentialCommitMessage::newFromRawCorpus($data);
     $message->pullDataFromConduit($conduit);
+
+    $this->validateCommitMessage($message);
+
     return $message;
+  }
+
+
+  /**
+   * @task message
+   */
+  private function getCommitMessageFromRevision($revision_id) {
+    $id = $this->normalizeRevisionID($revision_id);
+
+    $revision = $this->getConduit()->callMethodSynchronous(
+      'differential.query',
+      array(
+        'ids' => array($id),
+      ));
+    $revision = head($revision);
+
+    if (!$revision) {
+      throw new ArcanistUsageException(
+        "Revision '{$revision_id}' does not exist!");
+    }
+
+    if ($revision['authorPHID'] != $this->getUserPHID()) {
+      $rev_title = $revision['title'];
+      throw new ArcanistUsageException(
+        "You don't own revision D{$id} '{$rev_title}'. You can only update ".
+        "revisions you own.");
+    }
+
+    $message = $this->getConduit()->callMethodSynchronous(
+      'differential.getcommitmessage',
+      array(
+        'revision_id' => $id,
+        'edit'        => false,
+      ));
+
+    $obj = ArcanistDifferentialCommitMessage::newFromRawCorpus($message);
+    $obj->pullDataFromConduit($this->getConduit());
+
+    return $obj;
+  }
+
+
+  /**
+   * @task message
+   */
+  private function validateCommitMessage(
+    ArcanistDifferentialCommitMessage $message) {
+    $reviewers = $message->getFieldValue('reviewerPHIDs');
+    if (!$reviewers) {
+      $confirm = "You have not specified any reviewers. Continue anyway?";
+      if (!phutil_console_confirm($confirm)) {
+        throw new ArcanistUsageException('Specify reviewers and retry.');
+      }
+    } else if (in_array($this->getUserPHID(), $reviewers)) {
+      throw new ArcanistUsageException(
+        "You can not be a reviewer for your own revision.");
+    }
+  }
+
+
+  /**
+   * @task message
+   */
+  private function getUpdateMessage() {
+    $comments = $this->getArgument('message');
+    if (strlen($comments)) {
+      return $comments;
+    }
+
+    // When updating a revision using git without specifying '--message', try
+    // to prefill with the message in HEAD if it isn't a template message. The
+    // idea is that if you do:
+    //
+    //  $ git commit -a -m 'fix some junk'
+    //  $ arc diff
+    //
+    // ...you shouldn't have to retype the update message.
+    if ($this->requiresRepositoryAPI()) {
+      $repository_api = $this->getRepositoryAPI();
+      if ($repository_api instanceof ArcanistGitAPI) {
+        $comments = $this->getGitUpdateMessage();
+      }
+    }
+
+    $template =
+      $comments.
+      "\n\n".
+      "# Enter a brief description of the changes included in this update.".
+      "\n";
+
+    $comments = id(new PhutilInteractiveEditor($template))
+      ->setName('differential-update-comments')
+      ->editInteractively();
+
+    $comments = preg_replace('/^\s*#.*$/m', '', $comments);
+    $comments = rtrim($comments);
+
+    if (!strlen($comments)) {
+      throw new ArcanistUserAbortException();
+    }
+
+    return $comments;
+  }
+
+
+  /**
+   * @task message
+   */
+  private function getGitCommitMessage() {
+    $conduit = $this->getConduit();
+    $repository_api = $this->getRepositoryAPI();
+
+    $parser = new ArcanistDiffParser();
+    $commit_messages = $repository_api->getGitCommitLog();
+
+    if (!strlen($commit_messages)) {
+      if (!$repository_api->getHasCommits()) {
+        throw new ArcanistUsageException(
+          "This git repository doesn't have any commits yet. You need to ".
+          "commit something before you can diff against it.");
+      } else {
+        throw new ArcanistUsageException(
+          "The commit range doesn't include any commits. (Did you diff ".
+          "against the wrong commit?)");
+      }
+    }
+
+    $commit_messages = $parser->parseDiff($commit_messages);
+
+    $problems = array();
+    $parsed = array();
+    $hashes = array();
+    foreach ($commit_messages as $key => $change) {
+      $problems[$key] = array();
+      $hashes[$key] = $change->getCommitHash();
+
+      try {
+        $message = ArcanistDifferentialCommitMessage::newFromRawCorpus(
+          $change->getMetadata('message'));
+
+        $message->pullDataFromConduit($conduit);
+
+        $parsed[$key] = $message;
+      } catch (ArcanistDifferentialCommitMessageParserException $ex) {
+        foreach ($ex->getParserErrors() as $problem) {
+          $problems[$key][] = $problem;
+        }
+        continue;
+      }
+    }
+
+    $valid = array();
+    foreach ($problems as $key => $problem_list) {
+      if ($problem_list) {
+        continue;
+      }
+      $valid[$key] = $parsed[$key];
+    }
+
+    $blessed = null;
+    if (count($valid) == 1) {
+      $blessed = head($valid);
+    } else if (count($valid) > 1) {
+      echo phutil_console_wrap(
+        "Changes in the specified commit range include more than one commit ".
+        "with a valid template commit message. Choose the message you want ".
+        "to use (you can also use the -C flag).\n\n");
+      foreach ($valid as $key => $message) {
+        $hash = substr($hashes[$key], 0, 7);
+        $title = $commit_messages[$key]->getMetadata('message');
+        $title = head(explode("\n", trim($title)));
+        $title = phutil_utf8_shorten($title, 64);
+        echo "    {$hash}  {$title}\n";
+      }
+      echo "    none     Edit a blank template.";
+
+      do {
+        $choose = phutil_console_prompt('Use which commit message [none]?');
+        if ($choose == 'none' || $choose == '') {
+          return $this->getCommitMessageFromUser();
+        } else {
+          foreach ($valid as $key => $message) {
+            if (!strncmp($hashes[$key], $choose, strlen($choose))) {
+              $blessed = $valid[$key];
+              break;
+            }
+          }
+        }
+      } while (!$blessed);
+    }
+
+    if (!$blessed) {
+      $desc = implode("\n", array_mergev($problems));
+      if (count($problems) > 1) {
+        throw new ArcanistUsageException(
+          "All changes between the specified commits have template parsing ".
+          "problems:\n\n".$desc."\n\nIf you only want to create a diff ".
+          "(not a revision), use --preview to ignore commit messages.");
+      } else if (count($problems) == 1) {
+        $user_guide = 'http://phabricator.com/docs/phabricator/'.
+                      'article/Arcanist_User_Guide.html';
+        throw new ArcanistUsageException(
+          "Commit message is not properly formatted:\n\n".$desc."\n\n".
+          "You should use the standard git commit template to provide a ".
+          "commit message. If you only want to create a diff (not a ".
+          "revision), use --preview to ignore commit messages.\n\n".
+          "See this document for instructions on configuring the commit ".
+          "template:\n\n    {$user_guide}\n");
+      }
+    }
+
+    if ($blessed) {
+      $this->validateCommitMessage($blessed);
+    }
+
+    return $blessed;
+  }
+
+
+  /**
+   * Retrieve the git message in HEAD if it isn't a primary template message.
+   *
+   * @task message
+   */
+  private function getGitUpdateMessage() {
+    $repository_api = $this->getRepositoryAPI();
+
+    $parser = new ArcanistDiffParser();
+    $commit_messages = $repository_api->getGitCommitLog();
+    $commit_messages = $parser->parseDiff($commit_messages);
+
+    $head = reset($commit_messages);
+    $message = ArcanistDifferentialCommitMessage::newFromRawCorpus(
+      $head->getMetadata('message'));
+    if ($message->getRevisionID()) {
+      return null;
+    }
+
+    return trim($message->getRawCorpus());
+  }
+
+
+/* -(  Diff Specification  )------------------------------------------------- */
+
+
+  /**
+   * @task diffspec
+   */
+  private function getLintStatus($lint_result) {
+    $map = array(
+      ArcanistLintWorkflow::RESULT_OKAY       => 'okay',
+      ArcanistLintWorkflow::RESULT_ERRORS     => 'fail',
+      ArcanistLintWorkflow::RESULT_WARNINGS   => 'warn',
+      ArcanistLintWorkflow::RESULT_SKIP       => 'skip',
+    );
+    return idx($map, $lint_result, 'none');
+  }
+
+
+  /**
+   * @task diffspec
+   */
+  private function getUnitStatus($unit_result) {
+    $map = array(
+      ArcanistUnitWorkflow::RESULT_OKAY       => 'okay',
+      ArcanistUnitWorkflow::RESULT_FAIL       => 'fail',
+      ArcanistUnitWorkflow::RESULT_UNSOUND    => 'warn',
+      ArcanistUnitWorkflow::RESULT_SKIP       => 'skip',
+      ArcanistUnitWorkflow::RESULT_POSTPONED  => 'postponed',
+    );
+    return idx($map, $unit_result, 'none');
+  }
+
+
+  /**
+   * @task diffspec
+   */
+  private function buildDiffSpecification() {
+
+    $base_revision  = null;
+    $base_path      = null;
+    $vcs            = null;
+    $repo_uuid      = null;
+    $parent         = null;
+    $source_path    = null;
+    $branch         = null;
+
+    if ($this->requiresRepositoryAPI()) {
+      $repository_api = $this->getRepositoryAPI();
+
+      $base_revision  = $repository_api->getSourceControlBaseRevision();
+      $base_path      = $repository_api->getSourceControlPath();
+      $vcs            = $repository_api->getSourceControlSystemName();
+      $source_path    = $repository_api->getPath();
+      $branch         = $repository_api->getBranchName();
+
+      if ($repository_api instanceof ArcanistGitAPI) {
+        $info = $this->getGitParentLogInfo();
+        if ($info['parent']) {
+          $parent = $info['parent'];
+        }
+        if ($info['base_revision']) {
+          $base_revision = $info['base_revision'];
+        }
+        if ($info['base_path']) {
+          $base_path = $info['base_path'];
+        }
+        if ($info['uuid']) {
+          $repo_uuid = $info['uuid'];
+        }
+      } else if ($repository_api instanceof ArcanistSubversionAPI) {
+        $repo_uuid = $repository_api->getRepositorySVNUUID();
+      } else if ($repository_api instanceof ArcanistMercurialAPI) {
+        // TODO: Provide this information.
+      } else {
+        throw new Exception("Unsupported repository API!");
+      }
+    }
+
+    $project_id = null;
+    if ($this->requiresWorkingCopy()) {
+      $project_id = $this->getWorkingCopy()->getProjectID();
+    }
+
+    return array(
+      'sourceMachine'             => php_uname('n'),
+      'sourcePath'                => $source_path,
+      'branch'                    => $branch,
+      'sourceControlSystem'       => $vcs,
+      'sourceControlPath'         => $base_path,
+      'sourceControlBaseRevision' => $base_revision,
+      'parentRevisionID'          => $parent,
+      'repositoryUUID'            => $repo_uuid,
+      'creationMethod'            => 'arc',
+      'arcanistProject'           => $project_id,
+      'authorPHID'                => $this->getUserPHID(),
+    );
+  }
+
+
+/* -(  Diff Properties  )---------------------------------------------------- */
+
+
+  /**
+   * Update lint information for the diff.
+   *
+   * @return void
+   *
+   * @task diffprop
+   */
+  private function updateLintDiffProperty() {
+    if (!$this->unresolvedLint) {
+      return;
+    }
+
+    $data = array();
+    foreach ($this->unresolvedLint as $message) {
+      $data[] = array(
+        'path'        => $message->getPath(),
+        'line'        => $message->getLine(),
+        'char'        => $message->getChar(),
+        'code'        => $message->getCode(),
+        'severity'    => $message->getSeverity(),
+        'name'        => $message->getName(),
+        'description' => $message->getDescription(),
+      );
+    }
+
+    $this->updateDiffProperty('arc:lint', json_encode($data));
+  }
+
+
+  /**
+   * Update unit test information for the diff.
+   *
+   * @return void
+   *
+   * @task diffprop
+   */
+  private function updateUnitDiffProperty() {
+    if (!$this->unresolvedTests) {
+      return;
+    }
+
+    $data = array();
+    foreach ($this->unresolvedTests as $test) {
+      $data[] = array(
+        'name'      => $test->getName(),
+        'result'    => $test->getResult(),
+        'userdata'  => $test->getUserData(),
+      );
+    }
+
+    $this->updateDiffProperty('arc:unit', json_encode($data));
+  }
+
+
+  /**
+   * Update local commit information for the diff.
+   *
+   * @task diffprop
+   */
+  private function updateLocalDiffProperty() {
+    if ($this->isRawDiffSource()) {
+      return;
+    }
+
+    $local_info = $this->getRepositoryAPI()->getLocalCommitInformation();
+    if (!$local_info) {
+      return;
+    }
+
+    $this->updateDiffProperty('local:commits', json_encode($local_info));
+  }
+
+
+  /**
+   * Update an arbitrary diff property.
+   *
+   * @param string Diff property name.
+   * @param string Diff property value.
+   * @return void
+   *
+   * @task diffprop
+   */
+  private function updateDiffProperty($name, $data) {
+    $this->getConduit()->callMethodSynchronous(
+      'differential.setdiffproperty',
+      array(
+        'diff_id' => $this->getDiffID(),
+        'name'    => $name,
+        'data'    => $data,
+      ));
   }
 
 }

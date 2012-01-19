@@ -6,6 +6,8 @@
 
 
 
+phutil_require_module('arcanist', 'differential/constants/revisionhash');
+phutil_require_module('arcanist', 'differential/constants/revisionstatus');
 phutil_require_module('arcanist', 'exception/usage');
 phutil_require_module('arcanist', 'exception/usage/userabort');
 phutil_require_module('arcanist', 'parser/bundle');
@@ -13,6 +15,7 @@ phutil_require_module('arcanist', 'parser/diff/changetype');
 phutil_require_module('arcanist', 'workflow/base');
 
 phutil_require_module('phutil', 'console');
+phutil_require_module('phutil', 'console/editor');
 phutil_require_module('phutil', 'filesystem');
 phutil_require_module('phutil', 'filesystem/tempfile');
 phutil_require_module('phutil', 'future/exec');

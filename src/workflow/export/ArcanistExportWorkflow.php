@@ -1,7 +1,7 @@
 <?php
 
 /*
- * Copyright 2011 Facebook, Inc.
+ * Copyright 2012 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -187,6 +187,9 @@ EOTEXT
 
         $bundle = ArcanistBundle::newFromChanges($changes);
         $bundle->setProjectID($this->getWorkingCopy()->getProjectID());
+        $bundle->setBaseRevision(
+          $repository_api->getSourceControlBaseRevision());
+        // note we can't get a revision ID for SOURCE_LOCAL
         break;
       case self::SOURCE_REVISION:
         $bundle = $this->loadRevisionBundleFromConduit(

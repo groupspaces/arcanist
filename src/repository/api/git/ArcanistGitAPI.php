@@ -1,7 +1,7 @@
 <?php
 
 /*
- * Copyright 2011 Facebook, Inc.
+ * Copyright 2012 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -544,6 +544,14 @@ class ArcanistGitAPI extends ArcanistRepositoryAPI {
     return trim($owner);
   }
 
+  public function getWorkingCopyRevision() {
+    list($stdout) = execx(
+      '(cd %s; git rev-parse %s)',
+      $this->getPath(),
+      'HEAD');
+    return rtrim($stdout, "\n");
+  }
+
   public function supportsRelativeLocalCommits() {
     return true;
   }
@@ -600,6 +608,15 @@ class ArcanistGitAPI extends ArcanistRepositoryAPI {
   public function getFinalizedRevisionMessage() {
     return "You may now push this commit upstream, as appropriate (e.g. with ".
            "'git push', or 'git svn dcommit', or by printing and faxing it).";
+  }
+
+  public function getCommitMessageForRevision($rev) {
+    list($message) = execx(
+      '(cd %s && git log -n1 %s)',
+      $this->getPath(),
+      $rev);
+    $parser = new ArcanistDiffParser();
+    return head($parser->parseDiff($message));
   }
 
 }

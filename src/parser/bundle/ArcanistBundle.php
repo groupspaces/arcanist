@@ -1,7 +1,7 @@
 <?php
 
 /*
- * Copyright 2011 Facebook, Inc.
+ * Copyright 2012 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,6 +28,8 @@ class ArcanistBundle {
   private $blobs = array();
   private $diskPath;
   private $projectID;
+  private $baseRevision;
+  private $revisionID;
 
   public function setConduit(ConduitClient $conduit) {
     $this->conduit = $conduit;
@@ -39,6 +41,23 @@ class ArcanistBundle {
 
   public function getProjectID() {
     return $this->projectID;
+  }
+
+  public function setBaseRevision($base_revision) {
+    $this->baseRevision = $base_revision;
+  }
+
+  public function getBaseRevision() {
+    return $this->baseRevision;
+  }
+
+  public function setRevisionID($revision_id) {
+    $this->revisionID = $revision_id;
+    return $this;
+  }
+
+  public function getRevisionID() {
+    return $this->revisionID;
   }
 
   public static function newFromChanges(array $changes) {
@@ -63,12 +82,16 @@ class ArcanistBundle {
           'tar xfO %s meta.json',
           $path));
       $meta_info = $future->resolveJSON();
-      $version = idx($meta_info, 'version', 0);
-      $project_name = idx($meta_info, 'projectName');
+      $version       = idx($meta_info, 'version', 0);
+      $project_name  = idx($meta_info, 'projectName');
+      $base_revision = idx($meta_info, 'baseRevision');
+      $revision_id   = idx($meta_info, 'revisionID');
     // this arc bundle was probably made before we started storing meta info
     } else {
-      $version = 0;
-      $project_name = null;
+      $version       = 0;
+      $project_name  = null;
+      $base_revision = null;
+      $revision_id   = null;
     }
 
     $future = new ExecFuture(
@@ -92,6 +115,8 @@ class ArcanistBundle {
     $obj->changes = $changes;
     $obj->diskPath = $path;
     $obj->setProjectID($project_name);
+    $obj->setBaseRevision($base_revision);
+    $obj->setRevisionID($revision_id);
 
     return $obj;
   }
@@ -138,8 +163,12 @@ class ArcanistBundle {
       $blobs[$phid] = $this->getBlob($phid);
     }
 
-    $meta_info = array('version' => 1,
-                       'projectName' => $this->getProjectID());
+    $meta_info = array(
+      'version'      => 3,
+      'projectName'  => $this->getProjectID(),
+      'baseRevision' => $this->getBaseRevision(),
+      'revisionID'   => $this->getRevisionID(),
+    );
 
     $dir = Filesystem::createTemporaryDirectory();
     Filesystem::createDirectory($dir.'/hunks');
