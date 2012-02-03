@@ -19,6 +19,8 @@
 /**
  * Lint engine which enforces libphutil rules.
  *
+ * TODO: Deal with PhabricatorLintEngine extending this and then finalize it.
+ *
  * @group linter
  */
 class PhutilLintEngine extends ArcanistLintEngine {
@@ -88,6 +90,11 @@ class PhutilLintEngine extends ArcanistLintEngine {
     }
 
     $xhpast_linter = new ArcanistXHPASTLinter();
+    $xhpast_linter->setCustomSeverityMap(
+      array(
+        ArcanistXHPASTLinter::LINT_RAGGED_CLASSTREE_EDGE
+          => ArcanistLintSeverity::SEVERITY_WARNING,
+      ));
     $license_linter = new ArcanistApacheLicenseLinter();
     $linters[] = $xhpast_linter;
     $linters[] = $license_linter;

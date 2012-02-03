@@ -39,8 +39,9 @@
  *
  * @task  conduit   Conduit
  * @group workflow
+ * @stable
  */
-class ArcanistBaseWorkflow {
+abstract class ArcanistBaseWorkflow {
 
   private $conduit;
   private $conduitURI;
@@ -96,6 +97,15 @@ class ArcanistBaseWorkflow {
     return $this;
   }
 
+  /**
+   * Returns the URI the conduit connection within the workflow uses.
+   *
+   * @return string
+   * @task conduit
+   */
+  final public function getConduitURI() {
+    return $this->conduitURI;
+  }
 
   /**
    * Open a conduit channel to the server which was previously configured by
@@ -981,6 +991,14 @@ class ArcanistBaseWorkflow {
     }
 
     return array_values($paths);
+  }
+
+  protected function renderRevisionList(array $revisions) {
+    $list = array();
+    foreach ($revisions as $revision) {
+      $list[] = '     - D'.$revision['id'].': '.$revision['title']."\n";
+    }
+    return implode('', $list);
   }
 
 }

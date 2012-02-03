@@ -21,7 +21,7 @@
  *
  * @group workingcopy
  */
-class ArcanistGitAPI extends ArcanistRepositoryAPI {
+final class ArcanistGitAPI extends ArcanistRepositoryAPI {
 
   private $status;
   private $relativeCommit = null;
@@ -617,6 +617,64 @@ class ArcanistGitAPI extends ArcanistRepositoryAPI {
       $rev);
     $parser = new ArcanistDiffParser();
     return head($parser->parseDiff($message));
+  }
+
+  public function loadWorkingCopyDifferentialRevisions(
+    ConduitClient $conduit,
+    array $query) {
+
+    $messages = $this->getGitCommitLog();
+    if (!strlen($messages)) {
+      return array();
+    }
+
+    $parser = new ArcanistDiffParser();
+    $messages = $parser->parseDiff($messages);
+
+    // First, try to find revisions by explicit revision IDs in commit messages.
+    $revision_ids = array();
+    foreach ($messages as $message) {
+      $object = ArcanistDifferentialCommitMessage::newFromRawCorpus(
+        $message->getMetadata('message'));
+      if ($object->getRevisionID()) {
+        $revision_ids[] = $object->getRevisionID();
+      }
+    }
+
+    if ($revision_ids) {
+      $results = $conduit->callMethodSynchronous(
+        'differential.query',
+        $query + array(
+          'ids' => $revision_ids,
+        ));
+      return $results;
+    }
+
+    // If we didn't succeed, try to find revisions by hash.
+    $hashes = array();
+    foreach ($this->getLocalCommitInformation() as $commit) {
+      $hashes[] = array('gtcm', $commit['commit']);
+      $hashes[] = array('gttr', $commit['tree']);
+    }
+
+    $results = $conduit->callMethodSynchronous(
+      'differential.query',
+      $query + array(
+        'commitHashes' => $hashes,
+      ));
+
+    if ($results) {
+      return $results;
+    }
+
+    // If we still didn't succeed, try to find revisions by branch name.
+    $results = $conduit->callMethodSynchronous(
+      'differential.query',
+      $query + array(
+        'branches' => array($this->getBranchName()),
+      ));
+
+    return $results;
   }
 
 }
