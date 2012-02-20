@@ -213,10 +213,9 @@ EOTEXT
     $branch_name    = null;
     $repository_api = $this->getRepositoryAPI();
     $revision_id    = $bundle->getRevisionID();
+    $base_name      = "arcpatch";
     if ($revision_id) {
-      $base_name = "D{$revision_id}";
-    } else {
-      $base_name = "Arcanist-created-branch";
+      $base_name .= "-D{$revision_id}";
     }
 
     $suffixes = array(null, '-1', '-2', '-3');
@@ -771,6 +770,12 @@ EOTEXT
   }
 
   private function loadRevisionFromHash($hash) {
+    // TODO -- de-hack this as permissions become more clear with things
+    // like T848 (add scope to OAuth)
+    if (!$this->isConduitAuthenticated()) {
+      return null;
+    }
+
     $conduit = $this->getConduit();
 
     $revisions = $conduit->callMethodSynchronous(
