@@ -165,6 +165,13 @@ EOTEXT
         'param' => 'revision_id',
         'help'  => "Always update a specific revision.",
       ),
+      'auto' => array(
+        'help' => "(Unstable!) Heuristically select --create or --update. ".
+                  "This may become the default behvaior of arc.",
+        'conflicts' => array(
+          'raw',
+        ),
+      ),
       'nounit' => array(
         'help' =>
           "Do not run unit tests.",
@@ -277,26 +284,7 @@ EOTEXT
   }
 
   public function run() {
-
-    if ($this->requiresRepositoryAPI()) {
-      $repository_api = $this->getRepositoryAPI();
-      if ($this->getArgument('less-context')) {
-        $repository_api->setDiffLinesOfContext(3);
-      }
-    }
-
-    $output_json = $this->getArgument('json');
-    if ($output_json) {
-      // TODO: We should move this to a higher-level and put an indirection
-      // layer between echoing stuff and stdout.
-      ob_start();
-    }
-
-    $conduit = $this->getConduit();
-
-    if ($this->requiresWorkingCopy()) {
-      $this->requireCleanWorkingCopy();
-    }
+    $this->runDiffSetupBasics();
 
     $paths = $this->generateAffectedPaths();
 
@@ -319,6 +307,7 @@ EOTEXT
       'unitStatus'                => $this->getUnitStatus($unit_result),
     ) + $this->buildDiffSpecification();
 
+    $conduit = $this->getConduit();
     $diff_info = $conduit->callMethodSynchronous(
       'differential.creatediff',
       $diff_spec);
@@ -332,6 +321,8 @@ EOTEXT
     $this->updateLintDiffProperty();
     $this->updateUnitDiffProperty();
     $this->updateLocalDiffProperty();
+
+    $output_json = $this->getArgument('json');
 
     if ($this->shouldOnlyCreateDiff()) {
       if (!$output_json) {
@@ -472,7 +463,29 @@ EOTEXT
       ob_get_clean();
     }
 
+    $this->removeScratchFile('create-message');
+
     return 0;
+  }
+
+  private function runDiffSetupBasics() {
+    if ($this->requiresRepositoryAPI()) {
+      $repository_api = $this->getRepositoryAPI();
+      if ($this->getArgument('less-context')) {
+        $repository_api->setDiffLinesOfContext(3);
+      }
+    }
+
+    $output_json = $this->getArgument('json');
+    if ($output_json) {
+      // TODO: We should move this to a higher-level and put an indirection
+      // layer between echoing stuff and stdout.
+      ob_start();
+    }
+
+    if ($this->requiresWorkingCopy()) {
+      $this->requireCleanWorkingCopy();
+    }
   }
 
   protected function shouldOnlyCreateDiff() {
@@ -482,6 +495,10 @@ EOTEXT
     }
 
     if ($this->getArgument('update')) {
+      return false;
+    }
+
+    if ($this->getArgument('auto')) {
       return false;
     }
 
@@ -1096,11 +1113,33 @@ EOTEXT
   private function buildCommitMessage() {
     $is_create = $this->getArgument('create');
     $is_update = $this->getArgument('update');
+    $is_auto   = $this->getArgument('auto');
     $is_raw = $this->isRawDiffSource();
     $is_message = $this->getArgument('use-commit-message');
 
     if ($is_message) {
       return $this->getCommitMessageFromCommit($is_message);
+    }
+
+    if ($is_auto) {
+      $repository_api = $this->getRepositoryAPI();
+      $revisions = $repository_api->loadWorkingCopyDifferentialRevisions(
+        $this->getConduit(),
+        array(
+          'authors' => array($this->getUserPHID()),
+        ));
+      if (!$revisions) {
+        $is_create = true;
+      } else if (count($revisions) == 1) {
+        $revision = head($revisions);
+        $is_update = $revision['id'];
+      } else {
+        throw new ArcanistUsageException(
+          "There are several revisions in the specified commit range:\n\n".
+          $this->renderRevisionList($revisions)."\n".
+          "Use '--update' to choose one, or '--create' to create a new ".
+          "revision.");
+      }
     }
 
     $message = null;
@@ -1148,37 +1187,109 @@ EOTEXT
   private function getCommitMessageFromUser() {
     $conduit = $this->getConduit();
 
-    $template = $conduit->callMethodSynchronous(
-      'differential.getcommitmessage',
-      array(
-        'revision_id' => null,
-        'edit' => true,
-      ));
+    $template = null;
 
-    $template =
-      $template.
-      "\n\n".
-      "# Describe this revision.".
-      "\n";
-    $template = id(new PhutilInteractiveEditor($template))
-      ->setName('new-commit')
-      ->editInteractively();
-    $template = preg_replace('/^\s*#.*$/m', '', $template);
+    $saved = $this->readScratchFile('create-message');
+    if ($saved) {
+      $where = $this->getReadableScratchFilePath('create-message');
 
-    try {
-      $message = ArcanistDifferentialCommitMessage::newFromRawCorpus(
-        $template);
-      $message->pullDataFromConduit($conduit);
-      $this->validateCommitMessage($message);
-    } catch (Exception $ex) {
-      $path = Filesystem::writeUniqueFile('arc-commit-message', $template);
+      $preview = explode("\n", $saved);
+      $preview = array_shift($preview);
+      $preview = trim($preview);
+      $preview = phutil_utf8_shorten($preview, 64);
 
-      echo phutil_console_wrap(
-        "\n".
-        "Exception while parsing commit message! Message saved to ".
-        "'{$path}'. Use -F <file> to specify a commit message file.\n");
+      if ($preview) {
+        $preview = "Message begins:\n\n       {$preview}\n\n";
+      } else {
+        $preview = null;
+      }
 
-      throw $ex;
+      echo
+        "You have a saved revision message in '{$where}'.\n".
+        "{$preview}".
+        "You can use this message, or discard it.";
+
+      $use = phutil_console_confirm(
+        "Do you want to use this message?",
+        $default_no = false);
+      if ($use) {
+        $template = $saved;
+      } else {
+        $this->removeScratchFile('create-message');
+      }
+    }
+
+    $template_is_default = false;
+
+    if (!$template) {
+      $template = $conduit->callMethodSynchronous(
+        'differential.getcommitmessage',
+        array(
+          'revision_id' => null,
+          'edit' => true,
+        ));
+      $template_is_default = true;
+    }
+
+    $issues = array('Describe this revision.');
+
+    $done = false;
+    while (!$done) {
+      $template = rtrim($template)."\n\n";
+      foreach ($issues as $issue) {
+        $template .= '# '.$issue."\n";
+      }
+      $template .= "\n";
+
+      $new_template = id(new PhutilInteractiveEditor($template))
+        ->setName('new-commit')
+        ->editInteractively();
+
+      if ($template_is_default && ($new_template == $template)) {
+        throw new ArcanistUsageException(
+          "Template not edited.");
+      }
+
+      $template = preg_replace('/^\s*#.*$/m', '', $new_template);
+      $template = rtrim($template)."\n";
+      $wrote = $this->writeScratchFile('create-message', $template);
+      $where = $this->getReadableScratchFilePath('create-message');
+
+      try {
+
+        $message = ArcanistDifferentialCommitMessage::newFromRawCorpus(
+          $template);
+        $message->pullDataFromConduit($conduit);
+        $this->validateCommitMessage($message);
+        $done = true;
+      } catch (ArcanistDifferentialCommitMessageParserException $ex) {
+        echo "Commit message has errors:\n\n";
+        $issues = array('Resolve these errors:');
+        foreach ($ex->getParserErrors() as $error) {
+          echo "      - ".$error."\n";
+          $issues[] = '  - '.$error;
+        }
+        echo "\n";
+        echo "You must resolve these errors to continue.";
+        $again = phutil_console_confirm(
+          "Do you want to edit the message?",
+          $default_no = false);
+        if ($again) {
+          // Keep going.
+        } else {
+          $saved = null;
+          if ($wrote) {
+            $saved = "A copy was saved to '{$where}'.";
+          }
+          throw new ArcanistUsageException(
+            'Message has unresolved errrors. {$saved}');
+        }
+      } catch (Exception $ex) {
+        if ($wrote) {
+          echo phutil_console_wrap("(Commit messaged saved to '{$where}'.)");
+        }
+        throw $ex;
+      }
     }
 
     return $message;
