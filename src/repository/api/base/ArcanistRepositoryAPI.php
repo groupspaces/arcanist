@@ -133,9 +133,12 @@ abstract class ArcanistRepositoryAPI {
 
   private static function discoverGitBaseDirectory($root) {
     try {
-      list($stdout) = execx(
-        '(cd %s; git rev-parse --show-cdup)',
-        $root);
+
+      // NOTE: This awkward construction is to make sure things work on Windows.
+      $future = new ExecFuture('git rev-parse --show-cdup');
+      $future->setCWD($root);
+      list($stdout) = $future->resolvex();
+
       return Filesystem::resolvePath(rtrim($stdout, "\n"), $root);
     } catch (CommandException $ex) {
       if (preg_match('/^fatal: Not a git repository/', $ex->getStdErr())) {
@@ -158,6 +161,10 @@ abstract class ArcanistRepositoryAPI {
     ConduitClient $conduit,
     array $query);
 
+  public function hasLocalCommit($commit) {
+    throw new ArcanistCapabilityNotSupportedException($this);
+  }
+
   public function getCommitMessageForRevision($revision) {
     throw new ArcanistCapabilityNotSupportedException($this);
   }
@@ -179,5 +186,17 @@ abstract class ArcanistRepositoryAPI {
   public function getFinalizedRevisionMessage() {
     throw new ArcanistCapabilityNotSupportedException($this);
   }
+
+  public function execxLocal($pattern /*, ... */) {
+    $args = func_get_args();
+    return $this->buildLocalFuture($args)->resolvex();
+  }
+
+  public function execManualLocal($pattern /*, ... */) {
+    $args = func_get_args();
+    return $this->buildLocalFuture($args)->resolve();
+  }
+
+  abstract protected function buildLocalFuture(array $argv);
 
 }

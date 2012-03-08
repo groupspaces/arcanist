@@ -30,14 +30,23 @@ final class ArcanistDiffWorkflow extends ArcanistBaseWorkflow {
 
   private $hasWarnedExternals = false;
   private $unresolvedLint;
+  private $lintExcuse;
+  private $unitExcuse;
   private $testResults;
   private $diffID;
+  private $revisionID;
   private $unitWorkflow;
 
-  public function getCommandHelp() {
+  public function getCommandSynopses() {
     return phutil_console_format(<<<EOTEXT
       **diff** [__paths__] (svn)
       **diff** [__commit__] (git, hg)
+EOTEXT
+      );
+  }
+
+  public function getCommandHelp() {
+    return phutil_console_format(<<<EOTEXT
           Supports: git, svn, hg
           Generate a Differential diff or revision from local changes.
 
@@ -48,7 +57,6 @@ final class ArcanistDiffWorkflow extends ArcanistBaseWorkflow {
           Under svn, you can choose to include only some of the modified files
           in the working copy in the diff by specifying their paths. If you
           omit paths, all changes are included in the diff.
-
 EOTEXT
       );
   }
@@ -65,7 +73,15 @@ EOTEXT
   }
 
   public function requiresRepositoryAPI() {
-    return !$this->isRawDiffSource();
+    if (!$this->isRawDiffSource()) {
+      return true;
+    }
+
+    if ($this->getArgument('use-commit-message')) {
+      return true;
+    }
+
+    return false;
   }
 
   public function getDiffID() {
@@ -225,6 +241,11 @@ EOTEXT
       'allow-untracked' => array(
         'help' =>
           "Skip checks for untracked files in the working copy.",
+      ),
+      'excuse' => array(
+        'param' => 'excuse',
+        'help' => 'Provide a prepared in advance excuse for any lints/tests'.
+          ' shall they fail.',
       ),
       'less-context' => array(
         'help' =>
@@ -414,9 +435,11 @@ EOTEXT
           $revision['fields'] = $new_message->getFields();
         }
 
+        $revision['id'] = $message->getRevisionID();
+        $this->revisionID = $revision['id'];
+
         $update_message = $this->getUpdateMessage();
 
-        $revision['id'] = $message->getRevisionID();
         $revision['message'] = $update_message;
         $future = $conduit->callMethod(
           'differential.updaterevision',
@@ -436,7 +459,7 @@ EOTEXT
             'revision_id' => $result['revisionid'],
           ));
 
-        if ($this->requiresRepositoryAPI()) {
+        if (!$this->isRawDiffSource()) {
           $repository_api = $this->getRepositoryAPI();
           if (($repository_api instanceof ArcanistGitAPI) &&
               $this->shouldAmend()) {
@@ -1010,14 +1033,18 @@ EOTEXT
 
       $lint_result = $lint_workflow->run();
 
+      $continue = false;
       switch ($lint_result) {
         case ArcanistLintWorkflow::RESULT_OKAY:
           echo phutil_console_format(
             "<bg:green>** LINT OKAY **</bg> No lint problems.\n");
           break;
         case ArcanistLintWorkflow::RESULT_WARNINGS:
-          $continue = phutil_console_confirm(
-            "Lint issued unresolved warnings. Ignore them?");
+          $msg = "Lint issued unresolved warnings. ";
+          $msg .= $this->getArgument('excuse')
+            ? "Ignore them?"
+            : "Provide explanation and continue?";
+          $continue = phutil_console_confirm($msg);
           if (!$continue) {
             throw new ArcanistUserAbortException();
           }
@@ -1025,8 +1052,11 @@ EOTEXT
         case ArcanistLintWorkflow::RESULT_ERRORS:
           echo phutil_console_format(
             "<bg:red>** LINT ERRORS **</bg> Lint raised errors!\n");
-          $continue = phutil_console_confirm(
-            "Lint issued unresolved errors! Ignore lint errors?");
+          $msg = "Lint issued unresolved errors! ";
+          $msg .= $this->getArgument('excuse')
+            ? "Ignore lint errors?"
+            : "Provide explanation and continue?";
+          $continue = phutil_console_confirm($msg);
           if (!$continue) {
             throw new ArcanistUserAbortException();
           }
@@ -1034,6 +1064,21 @@ EOTEXT
       }
 
       $this->unresolvedLint = $lint_workflow->getUnresolvedMessages();
+      if ($continue) {
+        if ($this->getArgument('excuse')) {
+          $this->unitExcuse = $this->getArgument('excuse');
+        } else {
+          $template = "\n\n# Provide an explanation for these lint failures:\n";
+          foreach ($this->unresolvedLint as $message) {
+            $template = $template."# ".
+              $message->getPath().":".
+              $message->getLine()." ".
+              $message->getCode()." :: ".
+              $message->getDescription()."\n";
+          }
+          $this->lintExcuse = $this->getErrorExcuse($template);
+        }
+      }
 
       return $lint_result;
     } catch (ArcanistNoEngineException $ex) {
@@ -1067,6 +1112,7 @@ EOTEXT
       }
       $this->unitWorkflow = $this->buildChildWorkflow('unit', $argv);
       $unit_result = $this->unitWorkflow->run();
+      $explain = false;
       switch ($unit_result) {
         case ArcanistUnitWorkflow::RESULT_OKAY:
           echo phutil_console_format(
@@ -1083,15 +1129,41 @@ EOTEXT
         case ArcanistUnitWorkflow::RESULT_FAIL:
           echo phutil_console_format(
             "<bg:red>** UNIT ERRORS **</bg> Unit testing raised errors!\n");
-          $continue = phutil_console_confirm(
-            "Unit test results include failures! Ignore test failures?");
+          $msg = "Unit test results include failures! ";
+          $msg .= $this->getArgument('excuse')
+            ? "Ignore test failures?"
+            : "Explain test failures and continue?";
+          $continue = phutil_console_confirm($msg);
           if (!$continue) {
             throw new ArcanistUserAbortException();
           }
+          $explain = true;
           break;
       }
 
       $this->testResults = $this->unitWorkflow->getTestResults();
+      if ($explain) {
+        if ($this->getArgument('excuse')) {
+          $this->unitExcuse = $this->getArgument('excuse');
+        } else {
+          $template = "\n\n".
+            "# Provide an explanation for these unit test failures:\n";
+          foreach ($this->testResults as $test) {
+            $testResult = $test->getResult();
+            switch ($testResult) {
+              case ArcanistUnitTestResult::RESULT_FAIL:
+              case ArcanistUnitTestResult::RESULT_BROKEN:
+                $template = $template."# ".
+                  $test->getName()." :: ".
+                  $test->getResult()."\n";
+                break;
+              default:
+                break;
+            }
+          }
+          $this->unitExcuse = $this->getErrorExcuse($template);
+        }
+      }
 
       return $unit_result;
     } catch (ArcanistNoEngineException $ex) {
@@ -1101,6 +1173,22 @@ EOTEXT
     }
 
     return null;
+  }
+
+  private function getErrorExcuse($template) {
+    $new_template = id(new PhutilInteractiveEditor($template))
+      ->setName('error-excuse')
+      ->editInteractively();
+
+    if ($new_template == $template) {
+      throw new ArcanistUsageException(
+        "No explanation provided.");
+    }
+
+    $template = preg_replace('/^\s*#.*$/m', '', $new_template);
+    $template = rtrim($template)."\n";
+
+    return $template;
   }
 
 
@@ -1127,6 +1215,7 @@ EOTEXT
         $this->getConduit(),
         array(
           'authors' => array($this->getUserPHID()),
+          'status'  => 'status-open',
         ));
       if (!$revisions) {
         $is_create = true;
@@ -1220,18 +1309,32 @@ EOTEXT
     }
 
     $template_is_default = false;
+    $notes = array();
 
     if (!$template) {
+      list($fields, $notes) = $this->getDefaultCreateFields();
+      if (!$fields) {
+        $template_is_default = true;
+      }
+
       $template = $conduit->callMethodSynchronous(
         'differential.getcommitmessage',
         array(
           'revision_id' => null,
-          'edit' => true,
+          'edit'        => 'create',
+          'fields'      => $fields,
         ));
-      $template_is_default = true;
     }
 
-    $issues = array('Describe this revision.');
+    $issues = array(
+      'Describe this revision.',
+      '',
+      'If you intended to update a existing revision, use ',
+      '`arc diff --update <revision>`.',
+    );
+    if ($notes) {
+      $issues = array_merge($issues, array(''), $notes);
+    }
 
     $done = false;
     while (!$done) {
@@ -1256,7 +1359,6 @@ EOTEXT
       $where = $this->getReadableScratchFilePath('create-message');
 
       try {
-
         $message = ArcanistDifferentialCommitMessage::newFromRawCorpus(
           $template);
         $message->pullDataFromConduit($conduit);
@@ -1282,11 +1384,11 @@ EOTEXT
             $saved = "A copy was saved to '{$where}'.";
           }
           throw new ArcanistUsageException(
-            'Message has unresolved errrors. {$saved}');
+            "Message has unresolved errrors. {$saved}");
         }
       } catch (Exception $ex) {
         if ($wrote) {
-          echo phutil_console_wrap("(Commit messaged saved to '{$where}'.)");
+          echo phutil_console_wrap("(Commit messaged saved to '{$where}'.)\n");
         }
         throw $ex;
       }
@@ -1385,16 +1487,13 @@ EOTEXT
     //  $ git commit -a -m 'fix some junk'
     //  $ arc diff
     //
-    // ...you shouldn't have to retype the update message.
-    if ($this->requiresRepositoryAPI()) {
-      $repository_api = $this->getRepositoryAPI();
-      if ($repository_api instanceof ArcanistGitAPI) {
-        $comments = $this->getGitUpdateMessage();
-      }
-    }
+    // ...you shouldn't have to retype the update message. Similar things apply
+    // to Mercurial.
+
+    $comments = $this->getDefaultUpdateMessage();
 
     $template =
-      $comments.
+      rtrim($comments).
       "\n\n".
       "# Enter a brief description of the changes included in this update.".
       "\n";
@@ -1421,22 +1520,7 @@ EOTEXT
     $conduit = $this->getConduit();
     $repository_api = $this->getRepositoryAPI();
 
-    $parser = new ArcanistDiffParser();
-    $commit_messages = $repository_api->getGitCommitLog();
-
-    if (!strlen($commit_messages)) {
-      if (!$repository_api->getHasCommits()) {
-        throw new ArcanistUsageException(
-          "This git repository doesn't have any commits yet. You need to ".
-          "commit something before you can diff against it.");
-      } else {
-        throw new ArcanistUsageException(
-          "The commit range doesn't include any commits. (Did you diff ".
-          "against the wrong commit?)");
-      }
-    }
-
-    $commit_messages = $parser->parseDiff($commit_messages);
+    $commit_messages = $this->getLocalGitCommitMessages();
 
     $problems = array();
     $parsed = array();
@@ -1483,18 +1567,13 @@ EOTEXT
         $title = phutil_utf8_shorten($title, 64);
         echo "    {$hash}  {$title}\n";
       }
-      echo "    none     Edit a blank template.";
 
       do {
-        $choose = phutil_console_prompt('Use which commit message [none]?');
-        if ($choose == 'none' || $choose == '') {
-          return $this->getCommitMessageFromUser();
-        } else {
-          foreach ($valid as $key => $message) {
-            if (!strncmp($hashes[$key], $choose, strlen($choose))) {
-              $blessed = $valid[$key];
-              break;
-            }
+        $choose = phutil_console_prompt('Use which commit message?');
+        foreach ($valid as $key => $message) {
+          if (!strncmp($hashes[$key], $choose, strlen($choose))) {
+            $blessed = $valid[$key];
+            break;
           }
         }
       } while (!$blessed);
@@ -1527,9 +1606,95 @@ EOTEXT
     return $blessed;
   }
 
+  private function getLocalGitCommitMessages() {
+    $repository_api = $this->getRepositoryAPI();
+    $parser = new ArcanistDiffParser();
+    $commit_messages = $repository_api->getGitCommitLog();
+
+    if (!strlen($commit_messages)) {
+      if (!$repository_api->getHasCommits()) {
+        throw new ArcanistUsageException(
+          "This git repository doesn't have any commits yet. You need to ".
+          "commit something before you can diff against it.");
+      } else {
+        throw new ArcanistUsageException(
+          "The commit range doesn't include any commits. (Did you diff ".
+          "against the wrong commit?)");
+      }
+    }
+
+    return $parser->parseDiff($commit_messages);
+  }
+
+  private function getDefaultCreateFields() {
+    $empty = array(array(), array());
+
+    if ($this->isRawDiffSource()) {
+      return $empty;
+    }
+
+    $repository_api = $this->getRepositoryAPI();
+    if ($repository_api instanceof ArcanistGitAPI) {
+      return $this->getGitCreateFields();
+    }
+
+    return $empty;
+  }
+
+  private function getGitCreateFields() {
+    $conduit = $this->getConduit();
+    $changes = $this->getLocalGitCommitMessages();
+
+    $commits = array();
+    foreach ($changes as $key => $change) {
+      $commits[$change->getCommitHash()] = $change->getMetadata('message');
+    }
+
+    $messages = array();
+    foreach ($commits as $hash => $text) {
+      $messages[$hash] = ArcanistDifferentialCommitMessage::newFromRawCorpus(
+        $text);
+    }
+
+    $fields = array();
+    $notes = array();
+    foreach ($messages as $hash => $message) {
+      try {
+        $message->pullDataFromConduit($conduit, $partial = true);
+        $fields += $message->getFields();
+      } catch (ArcanistDifferentialCommitMessageParserException $ex) {
+        $fields += $message->getFields();
+
+        $frev = substr($hash, 0, 8);
+        $notes[] = "NOTE: commit {$frev} could not be completely parsed:";
+        foreach ($ex->getParserErrors() as $error) {
+          $notes[] = "  - {$error}";
+        }
+      }
+    }
+
+    return array($fields, $notes);
+  }
+
+  private function getDefaultUpdateMessage() {
+    if ($this->isRawDiffSource()) {
+      return null;
+    }
+
+    $repository_api = $this->getRepositoryAPI();
+    if ($repository_api instanceof ArcanistGitAPI) {
+      return $this->getGitUpdateMessage();
+    }
+
+    if ($repository_api instanceof ArcanistMercurialAPI) {
+      return $this->getMercurialUpdateMessage();
+    }
+
+    return null;
+  }
 
   /**
-   * Retrieve the git message in HEAD if it isn't a primary template message.
+   * Retrieve the git messages between HEAD and the last update.
    *
    * @task message
    */
@@ -1540,14 +1705,118 @@ EOTEXT
     $commit_messages = $repository_api->getGitCommitLog();
     $commit_messages = $parser->parseDiff($commit_messages);
 
-    $head = reset($commit_messages);
-    $message = ArcanistDifferentialCommitMessage::newFromRawCorpus(
-      $head->getMetadata('message'));
-    if ($message->getRevisionID()) {
+    if (count($commit_messages) == 1) {
+      // If there's only one message, assume this is an amend-based workflow and
+      // that using it to prefill doesn't make sense.
       return null;
     }
 
-    return trim($message->getRawCorpus());
+    // We have more than one message, so figure out which ones are new. We
+    // do this by pulling the current diff and comparing commit hashes in the
+    // working copy with attached commit hashes. It's not super important that
+    // we always get this 100% right, we're just trying to do something
+    // reasonable.
+
+    $local = $this->loadActiveLocalCommitInfo();
+    $hashes = ipull($local, null, 'commit');
+
+    $usable = array();
+    foreach ($commit_messages as $message) {
+      $text = $message->getMetadata('message');
+
+      $parsed = ArcanistDifferentialCommitMessage::newFromRawCorpus($text);
+      if ($parsed->getRevisionID()) {
+        // If this is an amended commit message with a revision ID, it's
+        // certainly not new. Stop marking commits as usable and break out.
+        break;
+      }
+
+      if (isset($hashes[$message->getCommitHash()])) {
+        // If this commit is currently part of the diff, stop using commit
+        // messages, since anything older than this isn't new.
+        break;
+      }
+
+      // Otherwise, this looks new, so it's a usable commit message.
+      $usable[] = $message;
+    }
+
+    if (!$usable) {
+      // No new commit messages, so we don't have anywhere to start from.
+      return null;
+    }
+
+    return $this->formatUsableLogs($usable);
+  }
+
+  /**
+   * Retrieve the hg messages between tip and the last update.
+   *
+   * @task message
+   */
+  private function getMercurialUpdateMessage() {
+    $repository_api = $this->getRepositoryAPI();
+
+    $messages = $repository_api->getCommitMessageLog();
+
+    $local = $this->loadActiveLocalCommitInfo();
+    $hashes = ipull($local, null, 'rev');
+
+    $usable = array();
+    foreach ($messages as $rev => $message) {
+      if (isset($hashes[$rev])) {
+        // If this commit is currently part of the active diff on the revision,
+        // stop using commit messages, since anything older than this isn't new.
+        break;
+      }
+
+      // Otherwise, this looks new, so it's a usable commit message.
+      $usable[] = $message;
+    }
+
+    if (!$usable) {
+      // No new commit messages, so we don't have anywhere to start from.
+      return null;
+    }
+
+    return $this->formatUsableLogs($usable);
+  }
+
+
+  /**
+   * Format log messages to prefill a diff update.
+   *
+   * @task message
+   */
+  private function formatUsableLogs(array $usable) {
+    // Flip messages so they'll read chronologically (oldest-first) in the
+    // template, e.g.:
+    //
+    //   - Added foobar.
+    //   - Fixed foobar bug.
+    //   - Documented foobar.
+
+    $usable = array_reverse($usable);
+    $default = array();
+    foreach ($usable as $message) {
+      // Pick the first line out of each message.
+      $text = trim($message);
+      $text = head(explode("\n", $text));
+      $default[] = '  - '.$text."\n";
+    }
+
+    return implode('', $default);
+  }
+
+  private function loadActiveLocalCommitInfo() {
+    $current_diff = $this->getConduit()->callMethodSynchronous(
+      'differential.getdiff',
+      array(
+        'revision_id' => $this->revisionID,
+      ));
+
+    $properties = idx($current_diff, 'properties', array());
+    return idx($properties, 'local:commits', array());
   }
 
 
@@ -1596,7 +1865,7 @@ EOTEXT
     $source_path    = null;
     $branch         = null;
 
-    if ($this->requiresRepositoryAPI()) {
+    if (!$this->isRawDiffSource()) {
       $repository_api = $this->getRepositoryAPI();
 
       $base_revision  = $repository_api->getSourceControlBaseRevision();
@@ -1678,6 +1947,10 @@ EOTEXT
     }
 
     $this->updateDiffProperty('arc:lint', json_encode($data));
+    if (strlen($this->lintExcuse)) {
+      $this->updateDiffProperty('arc:lint-excuse',
+        json_encode($this->lintExcuse));
+    }
   }
 
 
@@ -1704,6 +1977,10 @@ EOTEXT
     }
 
     $this->updateDiffProperty('arc:unit', json_encode($data));
+    if (strlen($this->unitExcuse)) {
+      $this->updateDiffProperty('arc:unit-excuse',
+        json_encode($this->unitExcuse));
+    }
   }
 
 

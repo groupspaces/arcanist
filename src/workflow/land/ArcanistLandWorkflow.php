@@ -23,9 +23,15 @@
  */
 final class ArcanistLandWorkflow extends ArcanistBaseWorkflow {
 
-  public function getCommandHelp() {
+  public function getCommandSynopses() {
     return phutil_console_format(<<<EOTEXT
       **land** [__options__] __branch__ [--onto __master__]
+EOTEXT
+      );
+  }
+
+  public function getCommandHelp() {
+    return phutil_console_format(<<<EOTEXT
           Supports: git
 
           Land an accepted change (currently sitting in local feature branch
@@ -37,7 +43,6 @@ final class ArcanistLandWorkflow extends ArcanistBaseWorkflow {
           immutable repositories (or when --merge is provided), it will perform
           a --no-ff merge (the branch will always be merged into __master__ with
           a merge commit).
-
 EOTEXT
       );
   }
@@ -81,6 +86,11 @@ EOTEXT
         'help' => 'Perform a --no-ff merge, not a --squash merge. If the '.
                   'project is marked as having an immutable history, this is '.
                   'the default behavior.',
+      ),
+      'revision' => array(
+        'param' => 'id',
+        'help'  => 'Use the message from a specific revision, rather than '.
+                   'inferring the revision based on branch content.',
       ),
       '*' => 'branch',
     );
@@ -171,25 +181,38 @@ EOTEXT
       $repository_api->parseRelativeLocalCommit(array($remote.'/'.$onto));
     }
 
-    $revisions = $repository_api->loadWorkingCopyDifferentialRevisions(
-      $this->getConduit(),
-      array(
-        'authors' => array($this->getUserPHID()),
-      ));
+    $revision_id = $this->getArgument('revision');
+    if ($revision_id) {
+      $revision_id = $this->normalizeRevisionID($revision_id);
+      $revisions = $this->getConduit()->callMethodSynchronous(
+        'differential.query',
+        array(
+          'ids' => array($revision_id),
+        ));
+      if (!$revisions) {
+        throw new ArcanistUsageException("No such revision 'D{$revision_id}'!");
+      }
+    } else {
+      $revisions = $repository_api->loadWorkingCopyDifferentialRevisions(
+        $this->getConduit(),
+        array(
+          'authors' => array($this->getUserPHID()),
+        ));
+    }
 
     if (!count($revisions)) {
       throw new ArcanistUsageException(
         "arc can not identify which revision exists on branch '{$branch}'. ".
         "Update the revision with recent changes to synchronize the branch ".
         "name and hashes, or use 'arc amend' to amend the commit message at ".
-        "HEAD.");
+        "HEAD, or use '--revision <id>' to select a revision explicitly.");
     } else if (count($revisions) > 1) {
       $message =
         "There are multiple revisions on feature branch '{$branch}' which are ".
         "not present on '{$onto}':\n\n".
         $this->renderRevisionList($revisions)."\n".
-        "Separate these revisions onto different branches, or manually land ".
-        "them in '{$onto}'.";
+        "Separate these revisions onto different branches, or use ".
+        "'--revision <id>' to select one.";
       throw new ArcanistUsageException($message);
     }
 
