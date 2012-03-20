@@ -38,6 +38,9 @@ final class ArcanistDiffParserTestCase extends ArcanistPhutilTestCase {
     $changes = $parser->parseDiff($contents);
 
     switch ($file) {
+      case 'colorized.hggitdiff':
+        $this->assertEqual(1, count($changes));
+        break;
       case 'basic-missing-both-newlines-plus.udiff':
       case 'basic-missing-both-newlines.udiff':
       case 'basic-missing-new-newline-plus.udiff':
@@ -514,6 +517,14 @@ EOTEXT
         $this->assertEqual(
           ArcanistDiffChangeType::TYPE_CHANGE,
           $change->getType());
+        break;
+      case 'svn-1.7-property-added.svndiff':
+        $this->assertEqual(1, count($changes));
+        $change = head($changes);
+        $new_properties = $change->getNewProperties();
+        $this->assertEqual(2, count($new_properties));
+        $this->assertEqual('*', idx($new_properties, 'svn:executable'));
+        $this->assertEqual('text/html', idx($new_properties, 'svn:mime-type'));
         break;
       default:
         throw new Exception("No test block for diff file {$diff_file}.");

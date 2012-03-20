@@ -191,6 +191,10 @@ final class ArcanistSubversionAPI extends ArcanistRepositoryAPI {
     return $info['URL'].'@'.$this->getSVNBaseRevisionNumber();
   }
 
+  public function getCanonicalRevisionName($string) {
+    throw new ArcanistCapabilityNotSupportedException($this);
+  }
+
   public function getSVNBaseRevisionNumber() {
     if ($this->svnBaseRevisionNumber) {
       return $this->svnBaseRevisionNumber;
@@ -287,6 +291,7 @@ final class ArcanistSubversionAPI extends ArcanistRepositoryAPI {
         '/^(Copied From URL): (\S+)$/m',
         '/^(Copied From Rev): (\d+)$/m',
         '/^(Repository UUID): (\S+)$/m',
+        '/^(Node Kind): (\S+)$/m',
       );
 
       $result = array();
@@ -422,6 +427,10 @@ EODIFF;
       return null;
     }
 
+    if (!file_exists($full_path)) {
+      return null;
+    }
+
     $data = Filesystem::readFile($full_path);
     $lines = explode("\n", $data);
     $len = count($lines);
@@ -538,6 +547,10 @@ EODIFF;
     }
 
     return $results;
+  }
+
+  public function updateWorkingCopy() {
+    $this->execxLocal('up');
   }
 
 }

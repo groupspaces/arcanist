@@ -132,6 +132,12 @@ final class ArcanistDiffParser {
 
         $from[$path] = $cpath;
       }
+      $type = $change->getType();
+      if (($type === ArcanistDiffChangeType::TYPE_MOVE_AWAY ||
+           $type === ArcanistDiffChangeType::TYPE_DELETE) &&
+          idx($info, 'Node Kind') === 'directory') {
+        $change->setFileType(ArcanistDiffChangeType::FILE_DIRECTORY);
+      }
     }
 
     foreach ($paths as $path => $status) {
@@ -305,6 +311,7 @@ final class ArcanistDiffParser {
           break;
         default:
           $this->didFailParse("Unknown diff type.");
+          break;
       }
     } while ($this->getLine() !== null);
 
@@ -401,19 +408,28 @@ final class ArcanistDiffParser {
       if ($done) {
         break;
       }
+      $prop_index = 2;
       $trimline = ltrim($line);
+      if ($trimline && $trimline[0] == '#') {
+        // in svn1.7, a line like ## -0,0 +1 ## is put between the Added: line
+        // and the line with the property change. If we have such a line, we'll
+        // just ignore it (:
+        $line = $this->nextLine();
+        $prop_index = 1;
+        $trimline = ltrim($line);
+      }
       if ($trimline && $trimline[0] == '+') {
         if ($op == 'Deleted') {
           $this->didFailParse('Unexpected "+" section in property deletion.');
         }
         $target = 'new';
-        $line = substr($trimline, 2);
+        $line = substr($trimline, $prop_index);
       } else if ($trimline && $trimline[0] == '-') {
         if ($op == 'Added') {
           $this->didFailParse('Unexpected "-" section in property addition.');
         }
         $target = 'old';
-        $line = substr($trimline, 2);
+        $line = substr($trimline, $prop_index);
       } else if (!strncmp($trimline, 'Merged', 6)) {
         if ($op == 'Added') {
           $target = 'new';
@@ -757,6 +773,18 @@ final class ArcanistDiffParser {
         $matches);
 
       if (!$ok) {
+        // It's possible we hit the style of an svn1.7 property change.
+        // This is a 4-line Index block, followed by an empty line, followed
+        // by a "Property changes on:" section similar to svn1.6.
+        if ($line == '') {
+          $line = $this->nextNonemptyLine();
+          $ok = preg_match('/^Property changes on:/', $line);
+          if (!$ok) {
+            $this->didFailParse("Confused by empty line");
+          }
+          $line = $this->nextLine();
+          return $this->parsePropertyHunk($change);
+        }
         $this->didFailParse("Expected hunk header '@@ -NN,NN +NN,NN @@'.");
       }
 
@@ -908,11 +936,36 @@ final class ArcanistDiffParser {
   }
 
   protected function didStartParse($text) {
-    // TODO: Removed an fb_utf8ize() call here. -epriestley
 
     // Eat leading whitespace. This may happen if the first change in the diff
     // is an SVN property change.
     $text = ltrim($text);
+
+    // Try to strip ANSI color codes from colorized diffs. ANSI color codes
+    // might be present in two cases:
+    //
+    //   - You piped a colorized diff into 'arc --raw' or similar (normally
+    //     we're able to disable colorization on diffs we control the generation
+    //     of).
+    //   - You're diffing a file which actually contains ANSI color codes.
+    //
+    // The former is vastly more likely, but we try to distinguish between the
+    // two cases by testing for a color code at the beginning of a line. If
+    // we find one, we know it's a colorized diff (since the beginning of the
+    // line should be "+", "-" or " " if the code is in the diff text).
+    //
+    // While it's possible a diff might be colorized and fail this test, it's
+    // unlikely, and it covers hg's color extension which seems to be the most
+    // stubborn about colorizing text despite stdout not being a TTY.
+    //
+    // We might incorrectly strip color codes from a colorized diff of a text
+    // file with color codes inside it, but this case is stupid and pathological
+    // and you've dug your own grave.
+
+    $ansi_color_pattern = '\x1B\[[\d;]*m';
+    if (preg_match('/^'.$ansi_color_pattern.'/m', $text)) {
+      $text = preg_replace('/'.$ansi_color_pattern.'/', '', $text);
+    }
 
     $this->text = explode("\n", $text);
     $this->line = 0;
@@ -953,8 +1006,9 @@ final class ArcanistDiffParser {
     $context = '';
     for ($ii = $min; $ii <= $max; $ii++) {
       $context .= sprintf(
-        "%8.8s %s\n",
+        "%8.8s %6.6s   %s\n",
         ($ii == $this->line) ? '>>>  ' : '',
+        $ii + 1,
         $this->text[$ii]);
     }
 

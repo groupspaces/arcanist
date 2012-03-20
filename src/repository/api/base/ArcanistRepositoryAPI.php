@@ -65,7 +65,9 @@ abstract class ArcanistRepositoryAPI {
         "any parent directory. Create an '.arcconfig' file to configure arc.");
     }
 
-    if (Filesystem::pathExists($root.'/.svn')) {
+    // check if we're in an svn working copy
+    list($err) = exec_manual('svn info');
+    if (!$err) {
       return newv('ArcanistSubversionAPI', array($root));
     }
 
@@ -155,8 +157,10 @@ abstract class ArcanistRepositoryAPI {
   abstract public function getCurrentFileData($path);
   abstract public function getLocalCommitInformation();
   abstract public function getSourceControlBaseRevision();
+  abstract public function getCanonicalRevisionName($string);
   abstract public function supportsRelativeLocalCommits();
   abstract public function getWorkingCopyRevision();
+  abstract public function updateWorkingCopy();
   abstract public function loadWorkingCopyDifferentialRevisions(
     ConduitClient $conduit,
     array $query);

@@ -92,16 +92,10 @@ EOTEXT
     return array(
       'message' => array(
         'short'       => 'm',
-        'supports'    => array(
-          'git',
-        ),
-        'nosupport'   => array(
-          'svn' => 'Edit revisions via the web interface when using SVN.',
-        ),
         'param'       => 'message',
         'help' =>
-          "When updating a revision under git, use the specified message ".
-          "instead of prompting.",
+          "When updating a revision, use the specified message instead of ".
+          "prompting.",
       ),
       'message-file' => array(
         'short' => 'F',
@@ -295,6 +289,12 @@ EOTEXT
       ),
       'no-amend' => array(
         'help' => 'Never amend commits in the working copy.',
+      ),
+      'uncommitted' => array(
+        'help' => 'Include uncommitted changes without prompting.',
+        'supports' => array(
+          'hg',
+        ),
       ),
       '*' => 'paths',
     );
@@ -507,7 +507,33 @@ EOTEXT
     }
 
     if ($this->requiresWorkingCopy()) {
-      $this->requireCleanWorkingCopy();
+      try {
+        $this->requireCleanWorkingCopy();
+      } catch (ArcanistUncommittedChangesException $ex) {
+        if ($repository_api instanceof ArcanistMercurialAPI) {
+
+          // Some Mercurial users prefer to use it like SVN, where they don't
+          // commit changes before sending them for review. This would be a
+          // pretty bad workflow in Git, but Mercurial users are significantly
+          // more expert at change management.
+
+          $use_dirty_changes = false;
+          if ($this->getArgument('uncommitted')) {
+            // OK.
+          } else {
+            $ok = phutil_console_confirm(
+              "You have uncommitted changes in your working copy. You can ".
+              "include them in the diff, or abort and deal with them. (Use ".
+              "'--uncommitted' to include them and skip this prompt.) ".
+              "Do you want to include uncommitted changes in the diff?");
+            if (!$ok) {
+              throw $ex;
+            }
+          }
+
+          $repository_api->setIncludeDirectoryStateInDiffs(true);
+        }
+      }
     }
   }
 
@@ -652,7 +678,7 @@ EOTEXT
 
       // Remove all files with baserev "0"; these files are new.
       foreach ($bases as $path => $baserev) {
-        if ($bases[$path] == 0) {
+        if ($bases[$path] <= 0) {
           unset($bases[$path]);
         }
       }
@@ -699,6 +725,10 @@ EOTEXT
       $changes = $parser->parseDiff($diff);
     } else if ($repository_api instanceof ArcanistMercurialAPI) {
       $diff = $repository_api->getFullMercurialDiff();
+      if (!strlen($diff)) {
+        throw new ArcanistUsageException(
+          "No changes found. (Did you specify the wrong commit range?)");
+      }
       $changes = $parser->parseDiff($diff);
     } else {
       throw new Exception("Repository API is not supported.");
@@ -751,7 +781,7 @@ EOTEXT
       }
     }
 
-    $try_encoding = null;
+    $try_encoding = nonempty($this->getArgument('encoding'), null);
 
     $utf8_problems = array();
     foreach ($changes as $change) {
@@ -764,29 +794,21 @@ EOTEXT
           // liberal about what they're willing to process.
           $is_binary = ArcanistDiffUtils::isHeuristicBinaryFile($corpus);
           if (!$is_binary) {
-            $try_encoding = nonempty($this->getArgument('encoding'), null);
-            if ($try_encoding === null) {
-              // Make a call to check if there's an encoding specified for this
-              // project.
+
+            if (!$try_encoding) {
               try {
-                  $project_info = $this->getConduit()->callMethodSynchronous(
-                      'arcanist.projectinfo',
-                      array(
-                          'name' => $this->getWorkingCopy()->getProjectID(),
-                      ));
-                  $try_encoding = nonempty($project_info['encoding'], false);
+                $try_encoding = $this->getRepositoryEncoding();
               } catch (ConduitClientException $e) {
-                  if ($e->getErrorCode() == 'ERR-BAD-ARCANIST-PROJECT') {
-                      echo phutil_console_wrap(
-                          "Lookup of encoding in arcanist project failed\n".
-                          $e->getMessage()
-                      );
-                      $try_encoding = false;
-                  } else {
-                      throw $e;
-                  }
+                if ($e->getErrorCode() == 'ERR-BAD-ARCANIST-PROJECT') {
+                  echo phutil_console_wrap(
+                    "Lookup of encoding in arcanist project failed\n".
+                    $e->getMessage());
+                } else {
+                  throw $e;
+                }
               }
             }
+
             if ($try_encoding) {
               // NOTE: This feature is HIGHLY EXPERIMENTAL and will cause a lot
               // of issues. Use it at your own risk.
@@ -1478,6 +1500,13 @@ EOTEXT
     $comments = $this->getArgument('message');
     if (strlen($comments)) {
       return $comments;
+    }
+
+    if ($this->getArgument('raw')) {
+      throw new ArcanistUsageException(
+        "When using '--raw' to update a revision, specify an update message ".
+        "with '--message'. (Normally, we'd launch an editor to ask you for a ".
+        "message, but can not do that because stdin is the diff source.)");
     }
 
     // When updating a revision using git without specifying '--message', try

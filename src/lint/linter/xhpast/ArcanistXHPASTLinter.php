@@ -53,6 +53,8 @@ final class ArcanistXHPASTLinter extends ArcanistLinter {
   const LINT_BINARY_EXPRESSION_SPACING = 27;
   const LINT_ARRAY_INDEX_SPACING       = 28;
   const LINT_RAGGED_CLASSTREE_EDGE     = 29;
+  const LINT_IMPLICIT_FALLTHROUGH      = 30;
+  const LINT_PHP_53_FEATURES           = 31;
 
 
   public function getLintNameMap() {
@@ -85,6 +87,8 @@ final class ArcanistXHPASTLinter extends ArcanistLinter {
       self::LINT_BINARY_EXPRESSION_SPACING => 'Space Around Binary Operator',
       self::LINT_ARRAY_INDEX_SPACING       => 'Spacing Before Array Index',
       self::LINT_RAGGED_CLASSTREE_EDGE     => 'Class Not abstract Or final',
+      self::LINT_IMPLICIT_FALLTHROUGH      => 'Implicit Fallthrough',
+      self::LINT_PHP_53_FEATURES           => 'Use Of PHP 5.3 Features',
     );
   }
 
@@ -111,10 +115,17 @@ final class ArcanistXHPASTLinter extends ArcanistLinter {
         => ArcanistLintSeverity::SEVERITY_WARNING,
       self::LINT_ARRAY_INDEX_SPACING
         => ArcanistLintSeverity::SEVERITY_WARNING,
+      self::LINT_IMPLICIT_FALLTHROUGH
+        => ArcanistLintSeverity::SEVERITY_WARNING,
 
       // This is disabled by default because it implies a very strict policy
       // which isn't necessary in the general case.
       self::LINT_RAGGED_CLASSTREE_EDGE
+        => ArcanistLintSeverity::SEVERITY_DISABLED,
+
+      // This is disabled by default because projects don't necessarily target
+      // a specific minimum version.
+      self::LINT_PHP_53_FEATURES
         => ArcanistLintSeverity::SEVERITY_DISABLED,
     );
   }
@@ -160,6 +171,9 @@ final class ArcanistXHPASTLinter extends ArcanistLinter {
 
     $root = $this->trees[$path]->getRootNode();
 
+    $root->buildSelectCache();
+    $root->buildTokenCache();
+
     $this->lintUseOfThisInStaticMethods($root);
     $this->lintDynamicDefines($root);
     $this->lintSurpriseConstructors($root);
@@ -182,6 +196,151 @@ final class ArcanistXHPASTLinter extends ArcanistLinter {
     $this->lintReusedIterators($root);
     $this->lintBraceFormatting($root);
     $this->lintRaggedClasstreeEdges($root);
+    $this->lintImplicitFallthrough($root);
+    $this->lintPHP53Features($root);
+  }
+
+  public function lintPHP53Features($root) {
+
+    $functions = $root->selectTokensOfType('T_FUNCTION');
+    foreach ($functions as $function) {
+
+      $next = $function->getNextToken();
+      while ($next) {
+        if ($next->isSemantic()) {
+          break;
+        }
+        $next = $next->getNextToken();
+      }
+
+      if ($next) {
+        if ($next->getTypeName() == '(') {
+          $this->raiseLintAtToken(
+            $function,
+            self::LINT_PHP_53_FEATURES,
+            'This codebase targets PHP 5.2, but anonymous functions were '.
+            'not introduced until PHP 5.3.');
+        }
+      }
+    }
+
+    $namespaces = $root->selectTokensOfType('T_NAMESPACE');
+    foreach ($namespaces as $namespace) {
+      $this->raiseLintAtToken(
+        $namespace,
+        self::LINT_PHP_53_FEATURES,
+        'This codebase targets PHP 5.2, but namespaces were not introduced '.
+        'until PHP 5.3.');
+    }
+
+    // NOTE: This is only "use x;", in anonymous functions the node type is
+    // n_LEXICAL_VARIABLE_LIST even though both tokens are T_USE.
+
+    // TODO: We parse n_USE in a slightly crazy way right now; that would be
+    // a better selector once it's fixed.
+
+    $uses = $root->selectDescendantsOfType('n_USE_LIST');
+    foreach ($uses as $use) {
+      $this->raiseLintAtNode(
+        $use,
+        self::LINT_PHP_53_FEATURES,
+        'This codebase targets PHP 5.2, but namespaces were not introduced '.
+        'until PHP 5.3.');
+    }
+  }
+
+  private function lintImplicitFallthrough($root) {
+    $switches = $root->selectDescendantsOfType('n_SWITCH');
+    foreach ($switches as $switch) {
+      $blocks = array();
+
+      $cases = $switch->selectDescendantsOfType('n_CASE');
+      foreach ($cases as $case) {
+        $blocks[] = $case;
+      }
+
+      $defaults = $switch->selectDescendantsOfType('n_DEFAULT');
+      foreach ($defaults as $default) {
+        $blocks[] = $default;
+      }
+
+
+      foreach ($blocks as $key => $block) {
+        $tokens = $block->getTokens();
+
+        // Get all the trailing nonsemantic tokens, since we need to look for
+        // "fallthrough" comments past the end of the semantic block.
+
+        $last = end($tokens);
+        while ($last && $last = $last->getNextToken()) {
+          if (!$last->isSemantic()) {
+            $tokens[] = $last;
+          }
+        }
+
+        $blocks[$key] = $tokens;
+      }
+
+      foreach ($blocks as $tokens) {
+
+        // Test each block (case or default statement) to see if it's OK. It's
+        // OK if:
+        //
+        //  - it is empty; or
+        //  - it ends in break, return, throw, continue or exit; or
+        //  - it has a comment with "fallthrough" in its text.
+
+        // Empty blocks are OK, so we start this at `true` and only set it to
+        // false if we find a statement.
+        $block_ok = true;
+
+        // Keeps track of whether the current statement is one that validates
+        // the block (break, return, throw, continue) or something else.
+        $statement_ok = false;
+
+        foreach ($tokens as $token) {
+          if (!$token->isSemantic()) {
+            // Liberally match "fall" in the comment text so that comments like
+            // "fallthru", "fall through", "fallthrough", etc., are accepted.
+            if (preg_match('/fall/i', $token->getValue())) {
+              $block_ok = true;
+              break;
+            }
+            continue;
+          }
+
+          $tok_type = $token->getTypeName();
+
+          if ($tok_type == ';') {
+            if ($statement_ok) {
+              $statment_ok = false;
+            } else {
+              $block_ok = false;
+            }
+            continue;
+          }
+
+          if ($tok_type == 'T_RETURN'   ||
+              $tok_type == 'T_BREAK'    ||
+              $tok_type == 'T_CONTINUE' ||
+              $tok_type == 'T_THROW'    ||
+              $tok_type == 'T_EXIT') {
+            $statement_ok = true;
+            $block_ok = true;
+          }
+        }
+
+        if (!$block_ok) {
+          $this->raiseLintAtToken(
+            head($tokens),
+            self::LINT_IMPLICIT_FALLTHROUGH,
+            "This 'case' or 'default' has a nonempty block which does not ".
+            "end with 'break', 'continue', 'return', 'throw' or 'exit'. Did ".
+            "you forget to add one of those? If you intend to fall through, ".
+            "add a '// fallthrough' comment to silence this warning.");
+        }
+      }
+    }
   }
 
   private function lintBraceFormatting($root) {
@@ -307,19 +466,18 @@ final class ArcanistXHPASTLinter extends ArcanistLinter {
 
 
   protected function lintHashComments($root) {
-    $tokens = $root->getTokens();
-    foreach ($tokens as $token) {
-      if ($token->getTypeName() == 'T_COMMENT') {
-        $value = $token->getValue();
-        if ($value[0] == '#') {
-          $this->raiseLintAtOffset(
-            $token->getOffset(),
-            self::LINT_COMMENT_STYLE,
-            'Use "//" single-line comments, not "#".',
-            '#',
-            '//');
-        }
+    foreach ($root->selectTokensOfType('T_COMMENT') as $comment) {
+      $value = $comment->getValue();
+      if ($value[0] != '#') {
+        continue;
       }
+
+      $this->raiseLintAtOffset(
+        $comment->getOffset(),
+        self::LINT_COMMENT_STYLE,
+        'Use "//" single-line comments, not "#".',
+        '#',
+        '//');
     }
   }
 
@@ -689,13 +847,12 @@ final class ArcanistXHPASTLinter extends ArcanistLinter {
         break;
       }
     }
-    foreach ($tokens as $token) {
-      if ($token->getTypeName() == 'T_CLOSE_TAG') {
-        $this->raiseLintAtToken(
-          $token,
-          self::LINT_PHP_CLOSE_TAG,
-          'Do not use the PHP closing tag, "?>".');
-      }
+
+    foreach ($root->selectTokensOfType('T_CLOSE_TAG') as $token) {
+      $this->raiseLintAtToken(
+        $token,
+        self::LINT_PHP_CLOSE_TAG,
+        'Do not use the PHP closing tag, "?>".');
     }
   }
 
@@ -1242,12 +1399,10 @@ final class ArcanistXHPASTLinter extends ArcanistLinter {
   }
 
   protected function lintTODOComments($root) {
-    $tokens = $root->getTokens();
-    foreach ($tokens as $token) {
-      if (!$token->isComment()) {
-        continue;
-      }
+    $comments = $root->selectTokensOfType('T_COMMENT') +
+                $root->selectTokensOfType('T_DOC_COMMENT');
 
+    foreach ($comments as $token) {
       $value = $token->getValue();
       $matches = null;
       $preg = preg_match_all(
@@ -1362,6 +1517,7 @@ final class ArcanistXHPASTLinter extends ArcanistLinter {
 
           default:
             $key = null;
+            break;
         }
 
         if ($key !== null) {

@@ -81,6 +81,11 @@ EOTEXT
         'help' =>
           "Apply changes from a git patchfile or unified patchfile.",
       ),
+      'encoding' => array(
+        'param' => 'encoding',
+        'help' =>
+          "Attempt to convert non UTF-8 patch into specified encoding.",
+      ),
       'update' => array(
         'supports' => array(
           'git', 'svn', 'hg'
@@ -264,11 +269,14 @@ EOTEXT
     // verify the base revision is valid
     // in a working copy that uses the git-svn bridge, the base revision might
     // be a svn uri instead of a git ref
+
+    // NOTE: Use 'cat-file', not 'rev-parse --verify', because 'rev-parse'
+    // always "verifies" any properly-formatted commit even if it does not
+    // exist.
     list($err) = exec_manual(
-      '(cd %s; git rev-parse --verify %s)',
+      '(cd %s; git cat-file -t %s)',
       $repository_api->getPath(),
-      $base_revision
-    );
+      $base_revision);
 
     if ($base_revision && !$err) {
       execx(
@@ -284,8 +292,8 @@ EOTEXT
     }
 
     echo phutil_console_format(
-      "Created and checked out branch {$branch_name}.\n"
-    );
+      "Created and checked out branch %s.\n",
+      $branch_name);
   }
 
   private function shouldUpdateWorkingCopy() {
@@ -293,27 +301,9 @@ EOTEXT
   }
 
   private function updateWorkingCopy() {
-    $repository_api = $this->getRepositoryAPI();
-    if ($repository_api instanceof ArcanistSubversionAPI) {
-      execx(
-        '(cd %s; svn up)',
-        $repository_api->getPath());
-      $message = "Updated to HEAD.  ";
-    } else if ($repository_api instanceof ArcanistGitAPI) {
-      execx(
-        '(cd %s; git pull)',
-        $repository_api->getPath());
-      $message = "Updated to HEAD.  ";
-    } else if ($repository_api instanceof ArcanistMercurialAPI) {
-      execx(
-        '(cd %s; hg up)',
-        $repository_api->getPath());
-      $message = "Updated to tip.  ";
-    } else {
-      throw new Exception('Unknown version control system.');
-    }
-
-    echo phutil_console_format($message."\n");
+    echo "Updating working copy...\n";
+    $this->getRepositoryAPI()->updateWorkingCopy();
+    echo "Done.\n";
   }
 
   public function run() {
@@ -359,6 +349,22 @@ EOTEXT
         throw $ex;
       }
     }
+
+    $try_encoding = nonempty($this->getArgument('encoding'), null);
+    if (!$try_encoding) {
+      if ($this->requiresConduit()) {
+        try {
+          $try_encoding = $this->getRepositoryEncoding();
+        } catch (ConduitClientException $e) {
+          $try_encoding = null;
+        }
+      }
+    }
+
+    if ($try_encoding) {
+      $bundle->setEncoding($try_encoding);
+    }
+
     $force = $this->getArgument('force', false);
     if ($force) {
       // force means don't do any sanity checks about the patch
@@ -615,7 +621,10 @@ EOTEXT
     $prompt_message = null;
 
     // if we have a revision id the commit message is in differential
-    if ($revision_id) {
+
+    // TODO: See T848 for the authenticated stuff.
+    if ($revision_id && $this->isConduitAuthenticated()) {
+
       $conduit        = $this->getConduit();
       $commit_message = $conduit->callMethodSynchronous(
         'differential.getcommitmessage',

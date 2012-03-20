@@ -64,6 +64,8 @@ abstract class ArcanistBaseWorkflow {
   private $arguments;
   private $command;
 
+  private $repositoryEncoding;
+
   private $arcanistConfiguration;
   private $parentWorkflow;
   private $workingDirectory;
@@ -685,70 +687,15 @@ abstract class ArcanistBaseWorkflow {
 
     $uncommitted = $api->getUncommittedChanges();
     if ($uncommitted) {
-      throw new ArcanistUsageException(
-        "You have uncommitted changes in this branch. Commit (or revert) them ".
-        "before proceeding.\n\n".
+      throw new ArcanistUncommittedChangesException(
+        "You have uncommitted changes in this working copy. Commit (or ".
+        "revert) them before proceeding.\n\n".
         $working_copy_desc.
         "  Uncommitted changes in working copy\n".
         "    ".implode("\n    ", $uncommitted)."\n");
     }
   }
 
-  protected function chooseRevision(
-    array $revision_data,
-    $revision_id,
-    $prompt = null) {
-
-    $revisions = array();
-    foreach ($revision_data as $data) {
-      $ref = ArcanistDifferentialRevisionRef::newFromDictionary($data);
-      $revisions[$ref->getID()] = $ref;
-    }
-
-    if ($revision_id) {
-      $revision_id = $this->normalizeRevisionID($revision_id);
-      if (empty($revisions[$revision_id])) {
-        throw new ArcanistChooseInvalidRevisionException();
-      }
-      return $revisions[$revision_id];
-    }
-
-    if (!count($revisions)) {
-      throw new ArcanistChooseNoRevisionsException();
-    }
-
-    $repository_api = $this->getRepositoryAPI();
-
-    $candidates = $revisions;
-
-    if (count($candidates) == 1) {
-      $candidate = reset($candidates);
-      $revision_id = $candidate->getID();
-    }
-
-    if ($revision_id) {
-      return $revisions[$revision_id];
-    }
-
-    $revision_indexes = array_keys($revisions);
-
-    echo "\n";
-    $ii = 1;
-    foreach ($revisions as $revision) {
-      echo '  ['.$ii++.'] D'.$revision->getID().' '.$revision->getName()."\n";
-    }
-
-    while (true) {
-      $id = phutil_console_prompt($prompt);
-      $id = trim(strtoupper($id), 'D');
-      if (isset($revisions[$id])) {
-        return $revisions[$id];
-      }
-      if (isset($revision_indexes[$id - 1])) {
-        return $revisions[$revision_indexes[$id - 1]];
-      }
-    }
-  }
 
   protected function loadDiffBundleFromConduit(
     ConduitClient $conduit,
@@ -805,6 +752,10 @@ abstract class ArcanistBaseWorkflow {
     $repository_api = $this->getRepositoryAPI();
     $full_path = $repository_api->getPath($path);
     if (is_dir($full_path)) {
+      return null;
+    }
+
+    if (!file_exists($full_path)) {
       return null;
     }
 
@@ -1005,9 +956,19 @@ abstract class ArcanistBaseWorkflow {
    *
    * @param   list          List of explicitly provided paths.
    * @param   string|null   Revision name, if provided.
+   * @param   mask          Mask of ArcanistRepositoryAPI flags to exclude.
+   *                        Defaults to ArcanistRepositoryAPI::FLAG_UNTRACKED.
    * @return  list          List of paths the workflow should act on.
    */
-  protected function selectPathsForWorkflow(array $paths, $rev) {
+  protected function selectPathsForWorkflow(
+    array $paths,
+    $rev,
+    $omit_mask = null) {
+
+    if ($omit_mask === null) {
+      $omit_mask = ArcanistRepositoryAPI::FLAG_UNTRACKED;
+    }
+
     if ($paths) {
       $working_copy = $this->getWorkingCopy();
       foreach ($paths as $key => $path) {
@@ -1028,7 +989,7 @@ abstract class ArcanistBaseWorkflow {
 
       $paths = $repository_api->getWorkingCopyStatus();
       foreach ($paths as $path => $flags) {
-        if ($flags & ArcanistRepositoryAPI::FLAG_UNTRACKED) {
+        if ($flags & $omit_mask) {
           unset($paths[$path]);
         }
       }
@@ -1165,6 +1126,20 @@ abstract class ArcanistBaseWorkflow {
 
     $repository_api = $this->getRepositoryAPI();
     return $repository_api->getPath('.arc/'.$path);
+  }
+
+  protected function getRepositoryEncoding() {
+    if ($this->repositoryEncoding) {
+      return $this->repositoryEncoding;
+    }
+
+    $project_info = $this->getConduit()->callMethodSynchronous(
+      'arcanist.projectinfo',
+      array(
+        'name' => $this->getWorkingCopy()->getProjectID(),
+      ));
+    $this->repositoryEncoding = nonempty($project_info['encoding'], 'UTF-8');
+    return $this->repositoryEncoding;
   }
 
 }
