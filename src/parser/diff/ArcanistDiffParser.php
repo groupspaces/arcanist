@@ -50,6 +50,7 @@ final class ArcanistDiffParser {
 
   public function setTryEncoding($encoding) {
     $this->tryEncoding = $encoding;
+    return $this;
   }
 
   public function forcePath($path) {
@@ -58,6 +59,7 @@ final class ArcanistDiffParser {
   }
 
   public function setChanges(array $changes) {
+    assert_instances_of($changes, 'ArcanistDiffChange');
     $this->changes = mpull($changes, null, 'getCurrentPath');
     return $this;
   }

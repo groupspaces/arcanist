@@ -73,6 +73,7 @@ final class ArcanistPhutilModuleLinter extends ArcanistLinter {
 
   private function setModuleInfo($key, array $info) {
     $this->moduleInfo[$key] = $info;
+    return $this;
   }
 
   private function getModulePathOnDisk($key) {
@@ -398,10 +399,9 @@ final class ArcanistPhutilModuleLinter extends ArcanistLinter {
         $old_file,
         $new_file);
       $message->setDependentMessages($resolvable);
-      foreach ($resolvable as $message) {
-        $message->setObsolete(true);
+      foreach ($resolvable as $resolvable_message) {
+        $resolvable_message->setObsolete(true);
       }
-      $message->setGenerateFile(true);
     }
   }
 

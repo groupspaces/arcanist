@@ -34,10 +34,12 @@ final class ArcanistBundle {
 
   public function setConduit(ConduitClient $conduit) {
     $this->conduit = $conduit;
+    return $this;
   }
 
   public function setProjectID($project_id) {
     $this->projectID = $project_id;
+    return $this;
   }
 
   public function getProjectID() {
@@ -46,6 +48,7 @@ final class ArcanistBundle {
 
   public function setBaseRevision($base_revision) {
     $this->baseRevision = $base_revision;
+    return $this;
   }
 
   public function setEncoding($encoding) {
@@ -546,7 +549,7 @@ final class ArcanistBundle {
   }
 
   private function buildHunkChanges(array $hunks) {
-
+    assert_instances_of($hunks, 'ArcanistDiffHunk');
     $result = array();
     foreach ($hunks as $hunk) {
       $small_hunks = $this->breakHunkIntoSmallHunks($hunk);

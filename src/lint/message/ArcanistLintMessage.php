@@ -33,7 +33,6 @@ final class ArcanistLintMessage {
   protected $originalText;
   protected $replacementText;
   protected $appliedToDisk;
-  protected $generateFile;
   protected $dependentMessages = array();
   protected $obsolete;
 
@@ -149,15 +148,6 @@ final class ArcanistLintMessage {
     return ($this->getLine() !== null);
   }
 
-  public function setGenerateFile($generate_file) {
-    $this->generateFile = $generate_file;
-    return $this;
-  }
-
-  public function getGenerateFile() {
-    return $this->generateFile;
-  }
-
   public function setObsolete($obsolete) {
     $this->obsolete = $obsolete;
     return $this;
@@ -174,7 +164,7 @@ final class ArcanistLintMessage {
 
   public function didApplyPatch() {
     if ($this->appliedToDisk) {
-      return;
+      return $this;
     }
     $this->appliedToDisk = true;
     foreach ($this->dependentMessages as $message) {
@@ -188,6 +178,7 @@ final class ArcanistLintMessage {
   }
 
   public function setDependentMessages(array $messages) {
+    assert_instances_of($messages, 'ArcanistLintMessage');
     $this->dependentMessages = $messages;
     return $this;
   }

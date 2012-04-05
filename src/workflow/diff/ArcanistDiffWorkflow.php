@@ -52,7 +52,7 @@ EOTEXT
 
           Under git, you can specify a commit (like __HEAD^^^__ or __master__)
           and Differential will generate a diff against the merge base of that
-          commit and HEAD. If you omit the commit, the default is __HEAD^__.
+          commit and HEAD.
 
           Under svn, you can choose to include only some of the modified files
           in the working copy in the diff by specifying their paths. If you
@@ -497,6 +497,18 @@ EOTEXT
       if ($this->getArgument('less-context')) {
         $repository_api->setDiffLinesOfContext(3);
       }
+
+      if ($repository_api->supportsRelativeLocalCommits()) {
+
+        // Parse the relative commit as soon as we can, to avoid generating
+        // caches we need to drop later and expensive discovery operations
+        // (particularly in Mercurial).
+
+        $relative = $this->getArgument('paths');
+        if ($relative) {
+          $repository_api->parseRelativeLocalCommit($relative);
+        }
+      }
     }
 
     $output_json = $this->getArgument('json');
@@ -612,7 +624,7 @@ EOTEXT
           "\n\n".
           "Modified 'svn:externals' files:".
           "\n\n".
-          '        '.phutil_console_wrap(implode("\n", $warn_externals), 8));
+          phutil_console_wrap(implode("\n", $warn_externals), 8));
         $prompt = "Generate a diff (with just local changes) anyway?";
         if (!phutil_console_confirm($prompt)) {
           throw new ArcanistUserAbortException();
@@ -622,8 +634,6 @@ EOTEXT
       }
 
     } else if ($repository_api->supportsRelativeLocalCommits()) {
-      $repository_api->parseRelativeLocalCommit(
-        $this->getArgument('paths', array()));
       $paths = $repository_api->getWorkingCopyStatus();
     } else {
       throw new Exception("Unknown VCS!");

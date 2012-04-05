@@ -57,7 +57,7 @@ EOTEXT
 
     $target = null;
     if ($this->getArgument('command')) {
-      $target = reset($this->getArgument('command'));
+      $target = head($this->getArgument('command'));
       if (empty($workflows[$target])) {
         throw new ArcanistUsageException(
           "Unrecognized command '{$target}'. Try 'arc help'.");
@@ -138,7 +138,7 @@ EOTEXT
           $docs = 'This option is not documented.';
         }
         $docs = phutil_console_wrap($docs, 14);
-        $optref[] = "              {$docs}\n";
+        $optref[] = "{$docs}\n";
       }
       if ($optref) {
         $optref = implode("\n", $optref);

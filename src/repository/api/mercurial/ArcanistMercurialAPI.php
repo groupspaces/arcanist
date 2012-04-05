@@ -61,8 +61,7 @@ final class ArcanistMercurialAPI extends ArcanistRepositoryAPI {
     list($stdout) = $this->execxLocal(
       'log -l 1 --template %s -r %s --',
       '{node}',
-      $this->getRelativeCommit());
-
+      $string);
     return $stdout;
   }
 
@@ -85,6 +84,8 @@ final class ArcanistMercurialAPI extends ArcanistRepositoryAPI {
     }
 
     $this->relativeCommit = $commit;
+    $this->dropCaches();
+
     return $this;
   }
 
@@ -464,9 +465,7 @@ final class ArcanistMercurialAPI extends ArcanistRepositoryAPI {
   }
 
   private function getDiffToRevision() {
-
-    // Clear status cache since it's now bogus.
-    $this->status = null;
+    $this->dropCaches();
 
     if ($this->includeDirectoryStateInDiffs) {
       // This is a magic Mercurial revision name which means "current
@@ -475,6 +474,11 @@ final class ArcanistMercurialAPI extends ArcanistRepositoryAPI {
     } else {
       return $this->getWorkingCopyRevision();
     }
+  }
+
+  private function dropCaches() {
+    $this->status = null;
+    $this->localCommitInfo = null;
   }
 
 }
