@@ -6,13 +6,10 @@
 
 
 
-phutil_require_module('arcanist', 'exception/usage');
-phutil_require_module('arcanist', 'exception/usage/userabort');
 phutil_require_module('arcanist', 'workflow/base');
-phutil_require_module('arcanist', 'workingcopyidentity');
 
 phutil_require_module('phutil', 'console');
 phutil_require_module('phutil', 'utils');
 
 
-phutil_require_source('ArcanistAliasWorkflow.php');
+phutil_require_source('ArcanistCloseWorkflow.php');

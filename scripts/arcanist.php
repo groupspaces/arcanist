@@ -121,8 +121,8 @@ try {
         $error_msg = sprintf(
           'Failed to load library "%s" at location "%s". Please check the '.
           '"phutil_libraries" setting in your .arcconfig file. Refer to '.
-          '<http://phabricator.com/docs/phabricator/article/'.
-          'Arcanist_User_Guide:_Configuring_a_New_Project.html> '.
+          '<http://www.phabricator.com/docs/phabricator/article/'.
+          'Arcanist_User_Guide_Configuring_a_New_Project.html> '.
           'for more information.',
           $name,
           $location);
@@ -168,7 +168,8 @@ try {
     list($new_command, $args) = ArcanistAliasWorkflow::resolveAliases(
       $command,
       $config,
-      $args);
+      $args,
+      $working_copy);
 
     if ($new_command) {
       $workflow = $config->buildWorkflow($new_command);
@@ -179,7 +180,7 @@ try {
         "Unknown command '{$command}'. Try 'arc help'.");
     } else {
       if ($config_trace_mode) {
-        $aliases = ArcanistAliasWorkflow::getAliases();
+        $aliases = ArcanistAliasWorkflow::getAliases($working_copy);
         $target = implode(' ', idx($aliases, $command, array()));
         echo "[alias: 'arc {$command}' -> 'arc {$target}']\n";
       }
@@ -314,7 +315,7 @@ try {
  * that exclude core functionality.
  */
 function sanity_check_environment() {
-  $min_version = '5.2.0';
+  $min_version = '5.2.3';
   $cur_version = phpversion();
   if (version_compare($cur_version, $min_version, '<')) {
     die_with_bad_php(
